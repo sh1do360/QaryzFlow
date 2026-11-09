@@ -9,6 +9,11 @@ if (-not (Test-Path -LiteralPath $pythonExe)) {
 Push-Location -LiteralPath $PSScriptRoot
 try {
     & $pythonExe -m unittest discover -s tests -v
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
+    & $pythonExe -m scripts.check_reference
     exit $LASTEXITCODE
 }
 finally {

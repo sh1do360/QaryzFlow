@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 from typing import cast
 
+import altair as alt
 import streamlit as st
 
 from qadam_engine import (
@@ -16,11 +18,14 @@ from qadam_engine import (
     effective_income,
     free_cash,
     make_plans,
+    monthly_budget,
     monthly_schedule,
     objective_explanation,
+    payment_within_limit,
     portfolio_summary,
     recommendation_reason,
     sort_plans,
+    stress_details,
 )
 from qadam_ml_demo import (
     DEFAULT_ROWS,
@@ -28,28 +33,32 @@ from qadam_ml_demo import (
     RANKING_MODEL_KEYS,
     RANKING_MODEL_LABELS,
     SyntheticModelDemo,
-    score_plan,
+    rank_feasible_plans,
+    score_sensitivity,
     train_synthetic_model,
 )
-from qadam_report import build_case_report
+from qadam_report import build_case_report, build_review_summary
+from qadam_synthetic import MAX_SEED, OBSERVED_PAYMENTS
 
 
 st.set_page_config(
-    page_title="QaryzFlow · Debt Restructuring",
+    page_title="QaryzFlow · Реструктуризация долга",
     page_icon="◈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 
-@st.cache_resource(show_spinner="Обучаем учебную модель на искусственных примерах…")
+@st.cache_resource(max_entries=8, show_spinner="Симулируем платежи и обучаем учебные модели…")
 def cached_synthetic_model(rows: int, seed: int) -> SyntheticModelDemo:
     return train_synthetic_model(rows=rows, seed=seed)
 
 
-def money(value: float | None, compact: bool = False) -> str:
+def money(value: float | None, compact: bool = False, *, decimals: int = 0) -> str:
     if value is None:
         return "—"
+    if decimals:
+        return f"{value:,.{decimals}f} ₸".replace(",", " ").replace(".", ",")
     amount = int(round(value))
     sign = "-" if amount < 0 else ""
     absolute = abs(amount)
@@ -64,6 +73,14 @@ def input_number(value: int | float | None, fallback: float) -> float:
     return fallback if value is None else float(value)
 
 
+def change_from_current(new_value: float, current_value: float) -> str:
+    difference = round(new_value - current_value)
+    if difference == 0:
+        return "Без изменения"
+    direction = "меньше" if difference < 0 else "больше"
+    return f"На {money(abs(difference))} {direction}"
+
+
 st.markdown(
     """
     <style>
@@ -73,11 +90,6 @@ st.markdown(
       [data-testid="stHeader"] { background:rgba(243,247,245,.88);backdrop-filter:blur(12px); }
       [data-testid="stSidebar"] { background:linear-gradient(180deg,#102d29 0%,#123630 100%);border-right:0; }
       [data-testid="stSidebar"] * { color:#eef7f3; }
-      [data-testid="stSidebar"] [data-testid="stExpander"] { background:#173d37 !important;border:1px solid rgba(255,255,255,.14) !important;border-radius:14px !important; }
-      [data-testid="stSidebar"] [data-testid="stExpander"] summary { background:transparent !important;color:#eef7f3 !important; }
-      [data-testid="stSidebar"] input,[data-testid="stSidebar"] textarea { color:#132321 !important;-webkit-text-fill-color:#132321;background:#fff; }
-      [data-testid="stSidebar"] input::placeholder,[data-testid="stSidebar"] textarea::placeholder { color:#73817c !important;opacity:1; }
-      [data-testid="stSidebar"] [data-baseweb="select"] div,[data-baseweb="popover"],[data-baseweb="popover"] *,[role="listbox"],[role="listbox"] *,[role="option"] { color:#132321 !important; }
       [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p { color:#b8cbc4;font-size:.78rem; }
       [data-testid="stSidebar"] hr { border-color:rgba(255,255,255,.14); }
       [data-testid="stSidebar"] [role="radiogroup"] { gap:4px; }
@@ -94,35 +106,20 @@ st.markdown(
       .brand-mark { width:40px;height:40px;border-radius:14px;background:linear-gradient(145deg,#c7f5df,#93e1c2);color:#103d32;display:grid;place-items:center;font-size:21px;font-weight:800;box-shadow:0 8px 20px rgba(3,18,15,.18); }
       .brand-name { font-size:18px;font-weight:800;letter-spacing:-.04em;color:#f4fbf8; }
       .brand-caption { color:#a7c4b9;font-size:10px;letter-spacing:.16em;text-transform:uppercase;margin-top:1px; }
-      .eyebrow { color:#638078;font-size:.68rem;letter-spacing:.15em;text-transform:uppercase;font-weight:800; }
-      .page-subtitle { color:var(--muted);font-size:.94rem;line-height:1.55;max-width:780px;margin:0 0 1.2rem; }
-      .status-pill { display:inline-flex;align-items:center;gap:7px;border:1px solid #cce8db;border-radius:999px;padding:7px 11px;background:#effaf4;color:#197454;font-weight:750;font-size:.69rem;letter-spacing:.03em;white-space:nowrap; }
-      .status-dot { width:7px;height:7px;border-radius:50%;background:#29a878;box-shadow:0 0 0 3px #d8f1e6; }
-      .case-context { display:flex;align-items:center;justify-content:space-between;gap:18px;background:#fff;border:1px solid var(--line);border-radius:16px;padding:13px 16px;margin:.65rem 0 1rem;box-shadow:0 5px 18px rgba(19,48,40,.035); }
-      .case-context-main { font-size:.94rem;font-weight:750;color:var(--ink);margin-top:4px; }
-      .case-id { color:#71847c;font-size:.66rem;letter-spacing:.13em;text-transform:uppercase;font-weight:750; }
       .panel-title { font-weight:780;color:var(--ink);font-size:1rem;margin-bottom:4px; }
       .panel-caption { font-size:.78rem;color:var(--muted);line-height:1.5;margin-bottom:14px; }
       [data-testid="stVerticalBlockBorderWrapper"] { background:#fff;border:1px solid var(--line) !important;border-radius:18px !important;box-shadow:0 8px 24px rgba(19,48,40,.045); }
-      .recommend-card { background:linear-gradient(135deg,#103b33 0%,#0a7862 100%);border:1px solid rgba(190,242,218,.16);border-radius:20px;padding:24px 25px;color:#f4fff9;position:relative;overflow:hidden;box-shadow:0 16px 34px rgba(10,76,61,.17); }
-      .recommend-card .eyebrow { color:#a7d9c7; }
-      .recommend-card h3 { color:#fff;font-size:1.2rem !important;margin:.4rem 0 .3rem; }
-      .recommend-card p { color:#d4eee4;font-size:.82rem;margin:0; }
-      .recommend-number { font-weight:800;font-size:1.65rem;letter-spacing:-.05em;color:#fff;line-height:1.1; }
-      .recommend-small { font-size:.72rem;color:#bbe2d3; }
       .signal { display:flex;align-items:flex-start;gap:9px;color:#40524e;font-size:.81rem;margin:10px 0; }
       .signal-mark { flex:0 0 19px;width:19px;height:19px;border-radius:50%;background:#e5f4ec;color:#087f69;display:grid;place-items:center;font-size:.7rem;font-weight:800; }
       .callout { border-radius:13px;background:#eef7f3;border:1px solid #dcece4;padding:13px 15px;color:#405a51;font-size:.8rem;line-height:1.55; }
       .callout strong { color:#164d3f; }
-      .tiny-note { color:#81908b;font-size:.72rem;line-height:1.5; }
-      .sidebar-section { color:#8eaea1;font-size:.65rem;font-weight:800;letter-spacing:.13em;text-transform:uppercase;margin:10px 0 5px; }
       .stButton > button,[data-testid="stDownloadButton"] > button { border-radius:11px;border:1px solid #d9e6e0;font-weight:750;transition:transform .15s ease,box-shadow .15s ease; }
       .stButton > button:hover,[data-testid="stDownloadButton"] > button:hover { border-color:#9fcab8;box-shadow:0 5px 14px rgba(20,84,67,.1);transform:translateY(-1px); }
       [data-testid="stMetric"] { background:#fff;border:1px solid var(--line);border-radius:16px;padding:16px 17px;box-shadow:0 6px 20px rgba(19,48,40,.035); }
       [data-testid="stMetricLabel"] { color:#70817c;font-size:.73rem;font-weight:700; }
       [data-testid="stMetricValue"] { color:var(--ink);font-weight:800;letter-spacing:-.045em; }
       [data-testid="stDataFrame"] { border:1px solid var(--line);border-radius:14px;overflow:hidden;background:#fff; }
-      @media(max-width:800px) { .block-container { padding:1rem 1rem 2rem; } h1 {font-size:1.65rem !important;} .case-context {align-items:flex-start;} .recommend-card {padding:19px;} }
+      @media(max-width:800px) { .block-container { padding:1rem 1rem 2rem; } h1 {font-size:1.65rem !important;} }
     </style>
     """,
     unsafe_allow_html=True,
@@ -130,16 +127,244 @@ st.markdown(
 
 
 def render_header(title: str, subtitle: str) -> None:
-    left, right = st.columns([0.76, 0.24], vertical_alignment="center")
-    with left:
-        st.markdown('<div class="eyebrow">QARYZFLOW · УСТОЙЧИВОЕ УРЕГУЛИРОВАНИЕ</div>', unsafe_allow_html=True)
-        st.title(title)
-        st.markdown(f'<div class="page-subtitle">{subtitle}</div>', unsafe_allow_html=True)
-    with right:
-        st.markdown(
-            '<div style="text-align:right"><span class="status-pill"><span class="status-dot"></span>ДЕМО · ВЫМЫШЛЕННЫЕ КЕЙСЫ</span></div>',
-            unsafe_allow_html=True,
+    st.caption("QaryzFlow · Учебный режим")
+    st.title(title, anchor=False)
+    st.write(subtitle)
+
+
+def render_case_ml_comparison(
+    case: BorrowerCase, plans: list[Plan], recommended: Plan | None
+) -> Plan | None:
+    with st.container(border=True):
+        enabled = st.toggle(
+            "Сравнить с ML в симуляции",
+            key="case_ml_comparison",
+            disabled=recommended is None,
         )
+        if recommended is None:
+            st.caption("Сравнение доступно, когда хотя бы один график проходит бюджетный лимит.")
+            return None
+        if not enabled:
+            st.caption("Посмотрите, какой из допустимых графиков выбрала бы модель на искусственных данных.")
+            return None
+
+        model_key = cast(
+            str,
+            st.selectbox(
+                "Модель для сравнения",
+                options=RANKING_MODEL_KEYS,
+                format_func=RANKING_MODEL_LABELS.__getitem__,
+                key="case_ml_model",
+            ),
+        )
+        demo = cached_synthetic_model(DEFAULT_ROWS, DEFAULT_SEED)
+        ranked = rank_feasible_plans(demo, case, plans, model_key)
+        ml_score, ml_plan = ranked[0]
+        rule_score = next(score for score, plan in ranked if plan.key == recommended.key)
+        st.caption("Баллы отражают искусственный исход в симуляции. Выбор по бюджету и заданной цели показан отдельно.")
+        st.dataframe(
+            [
+                {
+                    "Подход": label,
+                    "График": plan.title,
+                    "Максимальный платёж": money(plan.peak_monthly_payment),
+                    "Всего выплат": money(plan.total_repayment),
+                    "Стресс-проверки": f"{plan.stress_passes}/{plan.stress_total}",
+                    "Учебный балл (0–100)": round(100 * score, 1),
+                }
+                for label, plan, score in (
+                    ("По правилам", recommended, rule_score),
+                    ("По ML в симуляции", ml_plan, ml_score),
+                )
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        if ml_plan.key == recommended.key:
+            st.caption("Оба подхода выбрали один график.")
+        else:
+            payment_delta = f"{ml_plan.peak_monthly_payment - recommended.peak_monthly_payment:+,.0f}".replace(",", " ")
+            total_delta = f"{ml_plan.total_repayment - recommended.total_repayment:+,.0f}".replace(",", " ")
+            st.caption(
+                f"Разница ML-варианта к выбору по правилам: {payment_delta} ₸ к максимальному платежу, "
+                f"{total_delta} ₸ к общей сумме выплат."
+            )
+            changes = score_sensitivity(demo, case, recommended, ml_plan, model_key)
+            if any(abs(delta) >= 0.0005 for _, delta in changes):
+                with st.expander("Какие изменения повлияли на учебный балл"):
+                    st.caption("По одному подставляем параметры ML-варианта в график по правилам и сравниваем баллы модели.")
+                    st.dataframe(
+                        [
+                            {"Параметр": label, "Изменение балла": round(100 * delta, 2)}
+                            for label, delta in changes
+                        ],
+                        width="stretch",
+                        hide_index=True,
+                    )
+        return ml_plan
+
+
+def choose_review_plan(
+    case: BorrowerCase, eligible: list[Plan], recommended: Plan, objective: str, budget_share: float
+) -> Plan:
+    by_key = {plan.key: plan for plan in eligible}
+    selector_key = f"review_plan_{case.case_id}"
+    if st.session_state.get(selector_key, "auto") not in {"auto", *by_key}:
+        st.session_state[selector_key] = "auto"
+        st.info("Выбранный ранее график вышел за пределы текущих условий. Показано предложение по заданной цели.")
+
+    current_key = st.session_state.get(selector_key, "auto")
+    st.caption("Сравните три предложения или найдите другой допустимый график в списке ниже.")
+    cost_is_current = False
+    for column, (goal, label) in zip(
+        st.columns(3),
+        (("affordable", "Меньше платёж"), ("cost", "Меньше сумма выплат"), ("robust", "Больше стресс-проверок")),
+        strict=True,
+    ):
+        plan = choose_plan(eligible, goal)
+        if plan is None:
+            continue
+        keep_current = goal == "cost" and plan.key == "current"
+        cost_is_current = cost_is_current or keep_current
+        no_stress_passes = goal == "robust" and plan.stress_passes == 0
+        with column.container(border=True):
+            st.markdown(f"**{'Стресс-проверки' if no_stress_passes else label}**")
+            st.caption(plan.title)
+            st.metric("Максимум за месяц", money(plan.peak_monthly_payment))
+            st.write(f"Всего выплат **{money(plan.total_repayment)}**")
+            st.caption(f"Стресс-проверки {plan.stress_passes} из {plan.stress_total}")
+            if keep_current:
+                st.caption("Текущий график проходит бюджетный лимит и уже даёт минимальную сумму выплат.")
+            if no_stress_passes:
+                worst = max(stress_details(case, plan, budget_share), key=lambda check: check.shortfall)
+                st.caption("Ни один доступный график не прошёл ни одной стресс-проверки.")
+                st.caption(f"В этом варианте наибольшая нехватка — {money(worst.shortfall)} в месяце {worst.shortfall_month}. Сценарий «{worst.name}».")
+            active = current_key == plan.key
+            action = "Оставить текущий график" if keep_current else "Выбрать график"
+            st.button(
+                "Выбран для сравнения" if active else action,
+                key=f"{selector_key}_{goal}",
+                on_click=st.session_state.__setitem__,
+                args=(selector_key, plan.key),
+                disabled=active,
+                icon=":material/check:" if active else None,
+                width="stretch",
+            )
+
+    if "current" in by_key and not cost_is_current:
+        st.button(
+            "Оставить текущий график" if current_key != "current" else "Текущий график выбран",
+            key=f"{selector_key}_keep_current",
+            on_click=st.session_state.__setitem__,
+            args=(selector_key, "current"),
+            disabled=current_key == "current",
+            help="Текущий график укладывается в бюджетный лимит.",
+        )
+
+    labels = {"auto": f"По цели «{OBJECTIVES[objective]}» — {recommended.title}"}
+    labels.update(
+        {
+            plan.key: f"{plan.title} · {money(plan.peak_monthly_payment)} максимум · {money(plan.total_repayment)} всего"
+            for plan in eligible
+        }
+    )
+    selection = st.selectbox(
+        "График для обсуждения",
+        options=list(labels),
+        format_func=labels.__getitem__,
+        key=selector_key,
+        persist_state="session",
+        help="Строка «По цели» обновляется автоматически. Можно выбрать любой допустимый график вручную.",
+    )
+    return by_key.get(cast(str, selection), recommended)
+
+
+def render_payment_calendar(
+    case: BorrowerCase, budget_share: float, schedule_plans: list[tuple[str, Plan]]
+) -> None:
+    term = max(plan.term_months for _, plan in schedule_plans)
+    recovery_end = case.income_recovery_wait_months + case.income_recovery_months
+    preview = min(term, max(12, recovery_end))
+    budget = monthly_budget(case, budget_share, term)
+    series = {label: monthly_schedule(case, plan, term) for label, plan in schedule_plans}
+    series["Лимит платежа"] = [month.payment_limit for month in budget]
+    rows = [
+        {
+            "Месяц": month.month,
+            "График": label,
+            "Сумма": payment,
+            "Лимит": month.payment_limit,
+            "Превышение": 0.0 if payment_within_limit(payment, month.payment_limit) else payment - month.payment_limit,
+        }
+        for label, payments in series.items()
+        for month, payment in zip(budget, payments, strict=True)
+    ]
+    over_limit = [row for row in rows if row["Превышение"] > 0]
+    with st.container(border=True):
+        st.subheader("Помесячный бюджет и платежи", anchor=False)
+        full = st.toggle("Показать весь срок", key=f"calendar_full_{case.case_id}", disabled=preview == term)
+        horizon = term if full else preview
+        st.caption(f"Месяцы 1–{horizon}. В паузу начисленные проценты добавляются к долгу.")
+        colors = {
+            "Текущий график": "#63766e",
+            "График для обсуждения": "#13866d",
+            "Вариант для анализа": "#b86053",
+            "Вариант из ML-симуляции": "#8c5bb0",
+            "Лимит платежа": "#c46b16",
+        }
+        visible = [row for row in rows if row["Месяц"] <= horizon]
+        base = alt.Chart(alt.InlineData(values=visible)).encode(
+            x=alt.X("Месяц:Q", axis=alt.Axis(tickMinStep=1, format="d"), scale=alt.Scale(zero=False)),
+            y=alt.Y("Сумма:Q", title="Сумма, ₸"),
+        )
+        tooltips = [alt.Tooltip("Месяц:Q", format="d"), "График:N", alt.Tooltip("Сумма:Q", format=",.2f")]
+        lines = base.mark_line(strokeWidth=2.2, point=alt.OverlayMarkDef(size=20)).encode(
+            color=alt.Color("График:N", title=None, scale=alt.Scale(domain=list(series), range=[colors[label] for label in series])),
+            strokeDash=alt.condition(alt.datum["График"] == "Лимит платежа", alt.value([6, 4]), alt.value([1, 0])),
+            tooltip=tooltips,
+        )
+        breaches = base.transform_filter(alt.datum["Превышение"] > 0).mark_point(
+            shape="diamond", size=95, filled=True, color="#b9382e", stroke="#ffffff", strokeWidth=1,
+        ).encode(
+            tooltip=[*tooltips, alt.Tooltip("Лимит:Q", format=",.2f"), alt.Tooltip("Превышение:Q", format=",.2f")],
+        )
+        st.altair_chart(lines + breaches, width="stretch", alt="Платежи и лимит по месяцам. Ромб отмечает превышение лимита.")
+        if over_limit:
+            worst = max(over_limit, key=lambda row: row["Превышение"])
+            st.caption(
+                f"Ромбы отмечают платежи выше лимита. Наибольшее превышение за весь срок — "
+                f"{money(worst['Превышение'], decimals=2)} в месяце {worst['Месяц']}. {worst['График']}."
+            )
+            if any(row["Месяц"] > horizon for row in over_limit):
+                st.info("Некоторые платежи выше лимита за пределами этого интервала. Включите «Показать весь срок».")
+
+    with st.expander("Полный календарь выплат"):
+        for label, plan in schedule_plans:
+            st.markdown(f"**{label}**")
+            st.dataframe(
+                [
+                    {
+                        "Месяц": row.month,
+                        "Доход": money(month.income),
+                        "Лимит платежа": money(month.payment_limit),
+                        "Долг на начало": money(row.opening_balance),
+                        "Платёж": money(row.payment),
+                        "Выше лимита": (
+                            "—" if payment_within_limit(row.payment, month.payment_limit)
+                            else money(row.payment - month.payment_limit, decimals=2)
+                        ),
+                        "Начислено процентов": money(row.accrued_interest),
+                        "Уплачено процентов": money(row.interest_paid),
+                        "Погашено долга": money(row.principal_repaid),
+                        "Капитализировано": money(row.capitalized_interest),
+                        "Долг на конец": money(row.closing_balance),
+                    }
+                    for row, month in zip(amortization_schedule(case, plan), budget)
+                ],
+                width="stretch",
+                hide_index=True,
+                alt=f"Календарь выплат. {label}",
+            )
 
 
 def render_case_page(
@@ -155,270 +380,157 @@ def render_case_page(
         max_extension_months=max_extension_months,
         max_grace_months=max_grace_months,
     )
-    current = next(plan for plan in plans if plan.key == "current")
-    recommended = choose_plan(plans, objective)
-    feasible_count = sum(plan.is_feasible for plan in plans)
-    frontier = [plan for plan in plans if plan.is_pareto_optimal]
+    current = plans[0]
+    eligible = [plan for plan in sort_plans(plans, objective) if plan.is_feasible]
+    recommended = eligible[0] if eligible else None
+    cash = free_cash(case)
+    st.subheader("2. Выберите график", anchor=False)
+    cash_metric, limit_metric, plan_count = st.columns(3)
+    cash_metric.metric(
+        "Свободно в первый месяц",
+        money(cash),
+        f"Доход {money(effective_income(case))}",
+        delta_color="off",
+        delta_arrow="off",
+        help="Доход после снижения за вычетом обязательных расходов и других долгов.",
+    )
+    limit_metric.metric(
+        "Лимит платежа в первый месяц",
+        money(max(0.0, cash) * budget_share),
+        f"{budget_share:.0%} свободного бюджета",
+        delta_color="off",
+        delta_arrow="off",
+    )
+    plan_count.metric("Подходящие графики", str(len(eligible)), f"из {len(plans)} рассчитанных", delta_color="off", delta_arrow="off")
+
+    selected = None
     if recommended is not None:
-        closest: Plan = recommended
+        selected = choose_review_plan(case, eligible, recommended, objective, budget_share)
+        shown_plan = selected
+        shown_label = "График для обсуждения"
     else:
-        alternatives = [plan for plan in plans if plan.key != "current"]
-        closest = min(
-            alternatives,
-            key=lambda plan: (
-                plan.feasibility_gap,
-                plan.peak_monthly_payment,
-                plan.total_repayment,
-            ),
+        shown_plan = min(
+            (plan for plan in plans if plan.key != current.key),
+            key=lambda plan: (plan.feasibility_gap, plan.peak_monthly_payment, plan.total_repayment),
             default=current,
         )
-    reserve_months = case.savings / max(case.essential_expenses, 1.0)
-    cash = free_cash(case)
+        shown_label = "Вариант для анализа"
+        st.warning("При этих условиях подходящего графика нет. Можно изменить исходные данные или границы поиска в блоке «Изменить условия».")
 
-    render_header(
-        "Подбор графика урегулирования",
-        "Система перебирает варианты срока и паузы, отсекает графики выше бюджетного лимита и показывает компромиссы.",
-    )
-    st.markdown(
-        f"""
-        <div class="case-context">
-          <div>
-            <div class="case-id">УЧЕБНЫЙ КЕЙС · {case.case_id}</div>
-            <div class="case-context-main">{case.region} <span style="color:#9aa8a2">·</span> {case.segment}</div>
-          </div>
-          <div style="text-align:right">
-            <div class="case-id">Текущая оценка бюджета</div>
-            <div class="case-context-main">{money(effective_income(case))} доход после снижения</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Доход после снижения", money(effective_income(case), compact=True), f"Обычный {money(case.income, compact=True)}")
-    k2.metric("Свободный бюджет", money(cash, compact=True), "До платежа по этому долгу")
-    k3.metric("Подходящие графики", f"{feasible_count:,}".replace(",", " "), f"из {len(plans)} перебранных")
-    k4.metric(
-        "Стресс-проверки",
-        f"{recommended.stress_passes}/{recommended.stress_total}" if recommended else "Нет варианта",
-        "для выбранного графика" if recommended else "лимит не проходит",
-    )
-
-    st.write("")
-    left, right = st.columns([1.08, 0.92], gap="large")
-    with left:
-        with st.container(border=True):
-            st.markdown('<div class="panel-title">Свободный бюджет после максимального платежа</div>', unsafe_allow_html=True)
-            st.markdown('<div class="panel-caption">Для текущего графика учтён возможный финальный остаток; для нового — регулярный платёж после паузы.</div>', unsafe_allow_html=True)
-            cash_rows = [
-                {"График": "Текущий", "Свободно после платежа": cash - current.peak_monthly_payment},
-                {
-                    "График": "Выбранный" if recommended else "Ближайший, вне лимита",
-                    "Свободно после платежа": cash - closest.peak_monthly_payment,
-                },
-            ]
-            st.bar_chart(cash_rows, x="График", y="Свободно после платежа", color="#13866d", horizontal=True)
-            st.markdown(
-                f'<div class="tiny-note">Лимит платежа: <b>{money(max(0.0, cash) * budget_share)}</b> · резерв: <b>{reserve_months:.1f} мес.</b></div>',
-                unsafe_allow_html=True,
-            )
-
-        st.write("")
-        with st.container(border=True):
-            chart_title = "Компромисс: платёж и сумма выплат"
-            st.markdown(f'<div class="panel-title">{chart_title}</div>', unsafe_allow_html=True)
-            st.markdown('<div class="panel-caption">Показаны все сценарии, проходящие лимит, и текущий график для сравнения. Легенда выделяет выбранный вариант и границу Парето.</div>', unsafe_allow_html=True)
-            current_chart_status = ["Текущий график"]
-            if current.is_pareto_optimal:
-                current_chart_status.append("граница Парето")
-            if recommended and recommended.key == "current":
-                current_chart_status.append("выбранный вариант")
-            scatter_rows = [
-                {
-                    "График": "Текущий",
-                    "Тип": " · ".join(current_chart_status),
-                    "Максимальный платёж за месяц": current.peak_monthly_payment,
-                    "Сумма выплат": current.total_repayment,
-                }
-            ]
-            for plan in plans:
-                if not plan.is_feasible or plan.key == "current":
-                    continue
-                is_selected = recommended is not None and plan.key == recommended.key
-                if is_selected and plan.is_pareto_optimal:
-                    status = "Выбранный · граница Парето"
-                elif is_selected:
-                    status = "Выбранный вариант"
-                elif plan.is_pareto_optimal:
-                    status = "Граница Парето"
-                else:
-                    status = "Другой допустимый график"
-                scatter_rows.append(
-                    {
-                        "График": f"{plan.term_months} мес. / пауза {plan.grace_months}",
-                        "Тип": status,
-                        "Максимальный платёж за месяц": plan.peak_monthly_payment,
-                        "Сумма выплат": plan.total_repayment,
-                    }
-                )
-            st.scatter_chart(scatter_rows, x="Максимальный платёж за месяц", y="Сумма выплат", color="Тип")
-
-    with right:
-        if recommended:
-            st.markdown(
-                f"""
-                <div class="recommend-card">
-                  <div class="eyebrow">ВАРИАНТ ПО ВЫБРАННОЙ ЦЕЛИ · {OBJECTIVES[objective].upper()}</div>
-                  <h3>{recommended.title}</h3>
-                  <p>{recommended.description}</p>
-                  <div style="height:18px"></div>
-                  <div style="display:flex;gap:32px;flex-wrap:wrap">
-                    <div><div class="recommend-number">{money(recommended.monthly_payment, compact=True)}</div><div class="recommend-small">обычный платёж / мес.</div></div>
-                    <div><div class="recommend-number">{money(recommended.peak_monthly_payment, compact=True)}</div><div class="recommend-small">максимальный с финальным остатком</div></div>
-                    <div><div class="recommend-number">{money(recommended.total_repayment, compact=True)}</div><div class="recommend-small">всего выплат за срок</div></div>
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+    st.subheader("3. Сравните с текущим", anchor=False)
+    with st.container(border=True):
+        st.markdown(f"**{shown_label} · {shown_plan.title}**")
+        st.caption("Изменения ниже указаны относительно текущего графика.")
+        peak, total, stress = st.columns(3)
+        peak.metric(
+            "Максимальный платёж",
+            money(shown_plan.peak_monthly_payment),
+            change_from_current(shown_plan.peak_monthly_payment, current.peak_monthly_payment),
+            delta_color="off",
+            delta_arrow="off",
+        )
+        total.metric(
+            "Всего выплат",
+            money(shown_plan.total_repayment),
+            change_from_current(shown_plan.total_repayment, current.total_repayment),
+            delta_color="off",
+            delta_arrow="off",
+        )
+        stress.metric("Пройдено стресс-проверок", f"{shown_plan.stress_passes} из {shown_plan.stress_total}")
+        if selected is not None:
+            st.caption(recommendation_reason(case, selected, budget_share)[0])
+            st.download_button(
+                "Скачать краткое сравнение",
+                data=build_review_summary(case, current, selected, budget_share),
+                file_name=f"qaryzflow_{case.case_id.lower()}_review.html",
+                mime="text/html",
+                on_click="ignore",
+                icon=":material/download:",
+                help="Откройте скачанный файл в браузере для просмотра или печати.",
             )
         else:
-            st.warning("По введённому бюджету подходящего графика нет. Ниже показан вариант с наименьшим превышением лимита для обсуждения, а не рекомендация.")
-            st.markdown(
-                f"""
-                <div class="recommend-card">
-                  <div class="eyebrow">НЕ ПРОХОДИТ БЮДЖЕТНЫЙ ЛИМИТ</div>
-                  <h3>{closest.title}</h3>
-                <p>Максимальный платёж выше установленного лимита на {money(closest.feasibility_gap)} в месяц.</p>
-                  <div style="height:18px"></div>
-                  <div class="recommend-number">{money(closest.monthly_payment, compact=True)}</div>
-                  <div class="recommend-small">платёж после паузы · только для анализа</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        st.write("")
-        with st.container(border=True):
-            st.markdown('<div class="panel-title">Почему выбран этот график</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="panel-caption">{objective_explanation(objective)}</div>', unsafe_allow_html=True)
-            if recommended:
-                for reason in recommendation_reason(case, recommended, budget_share):
-                    st.markdown(f'<div class="signal"><span class="signal-mark">✓</span><span>{reason}</span></div>', unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    f'<div class="signal"><span class="signal-mark">!</span><span>Максимальный платёж ближайшего варианта превышает лимит на {money(closest.feasibility_gap)} в месяц.</span></div>',
-                    unsafe_allow_html=True,
-                )
-            st.markdown(
-                '<div class="callout"><strong>Стресс-проверки — не прогноз.</strong> Это четыре заданных изменения дохода и расходов. Они показывают, сохраняется ли выбранный бюджетный лимит при таких условиях.</div>',
-                unsafe_allow_html=True,
-            )
-
-    st.write("")
-    with st.container(border=True):
-        st.markdown('<div class="panel-title">Помесячный график · первые 12 месяцев</div>', unsafe_allow_html=True)
-        selected_schedule_label = "Выбранный график" if recommended else "Ближайший вариант · вне лимита"
-        st.markdown(
-            '<div class="panel-caption">Текущий график учитывает возможный остаток долга в конце срока. Для нового графика проценты на время паузы капитализируются.</div>',
-            unsafe_allow_html=True,
-        )
-        months = list(range(1, 13))
-        st.line_chart(
-            {
-                "Месяц": months,
-                "Текущий график": monthly_schedule(case, current, 12),
-                selected_schedule_label: monthly_schedule(case, closest, 12),
-            },
-            x="Месяц",
-            y=["Текущий график", selected_schedule_label],
-            color=["#9aa9a3", "#13866d"],
-        )
-
-    with st.expander("Подробная разбивка выплат", expanded=False):
-        st.caption(
-            "Показывает, сколько процентов начисляется и уплачивается, какая часть платежа гасит долг, "
-            "и сколько процентов добавляется к долгу во время паузы или при недостаточном платеже."
-        )
-        schedule_plans = [("Текущий график", current)]
-        if closest.key != current.key:
-            schedule_plans.append((selected_schedule_label, closest))
-
-        for schedule_label, schedule_plan in schedule_plans:
-            rows = amortization_schedule(case, schedule_plan)
-            st.markdown(f"**{schedule_label}**")
             st.caption(
-                f"Всего выплат: {money(sum(row.payment for row in rows))} · "
-                f"начислено процентов: {money(sum(row.accrued_interest for row in rows))} · "
-                f"капитализировано: {money(sum(row.capitalized_interest for row in rows))}"
-            )
-            st.dataframe(
-                [
-                    {
-                        "Месяц": row.month,
-                        "Долг на начало": money(row.opening_balance),
-                        "Платёж": money(row.payment),
-                        "Начислено процентов": money(row.accrued_interest),
-                        "Уплачено процентов": money(row.interest_paid),
-                        "Погашено долга": money(row.principal_repaid),
-                        "Капитализировано процентов": money(row.capitalized_interest),
-                        "Долг на конец": money(row.closing_balance),
-                    }
-                    for row in rows
-                ],
-                width="stretch",
-                hide_index=True,
+                f"Ближайший к лимиту новый график для разбора. "
+                f"В месяце {shown_plan.budget_check_month} не хватает {money(shown_plan.feasibility_gap)}."
             )
 
-    st.write("")
-    with st.container(border=True):
-        st.markdown('<div class="panel-title">Графики на границе компромиссов</div>', unsafe_allow_html=True)
-        st.markdown(
-            f'<div class="panel-caption">Цель подбора: {OBJECTIVES[objective].lower()}. Показаны базовый график и недоминируемые варианты; полный перебор доступен в JSON.</div>',
-            unsafe_allow_html=True,
-        )
-        display_plans = {plan.key: plan for plan in frontier}
-        display_plans[current.key] = current
-        if not recommended:
-            display_plans[closest.key] = closest
-        table_rows = []
-        for plan in sort_plans(list(display_plans.values()), objective):
-            table_rows.append(
-                {
-                    "Статус": (
-                        "Текущий график"
-                        if plan.key == "current"
-                        else "Подходит по бюджету"
-                        if plan.is_feasible
-                        else "Выше бюджетного лимита"
-                    ),
-                    "Сценарий": plan.title,
-                    "Платёж / мес.": money(plan.monthly_payment),
-                    "Максимальный платёж*": money(plan.peak_monthly_payment),
-                    "Финальный остаток": money(plan.final_balance_payment),
-                    "Всего выплат": money(plan.total_repayment),
-                    "Стоимость финансирования*": money(plan.interest_cost),
-                    "Срок": f"{plan.term_months} мес.",
-                    "Пауза": f"{plan.grace_months} мес.",
-                    "Стресс-сценарии": f"{plan.stress_passes}/{plan.stress_total}",
-                }
+    calendar_tab, stress_tab, plans_tab, ml_tab = st.tabs(["Календарь выплат", "Стресс-проверки", "Все варианты", "ML-сравнение"])
+    with ml_tab:
+        ml_plan = render_case_ml_comparison(case, plans, recommended)
+
+    with calendar_tab:
+        with st.expander("Текущий и выбранный графики · все показатели"):
+            st.table(
+                [
+                    {"Показатель": label, "Текущий график": before, shown_label: after}
+                    for label, before, after in (
+                        ("Срок", f"{current.term_months} мес.", f"{shown_plan.term_months} мес."),
+                        ("Пауза", f"{current.grace_months} мес.", f"{shown_plan.grace_months} мес."),
+                        ("Обычный платёж", money(current.monthly_payment), money(shown_plan.monthly_payment)),
+                        ("Максимальный платёж", money(current.peak_monthly_payment), money(shown_plan.peak_monthly_payment)),
+                        ("Всего выплат", money(current.total_repayment), money(shown_plan.total_repayment)),
+                    )
+                ],
+                hide_index=True,
+                alt="Платежи и стоимость текущего и рассматриваемого графиков",
             )
-        st.dataframe(table_rows, width="stretch", hide_index=True)
-        st.caption("*Бюджетный лимит проверяет максимальный платёж за месяц, включая финальный остаток. Расчёт без комиссий, страховок и иных договорных платежей.")
+        schedule_plans = [("Текущий график", current)]
+        if shown_plan.key != current.key:
+            schedule_plans.append((shown_label, shown_plan))
+        if ml_plan and ml_plan.key not in {plan.key for _, plan in schedule_plans}:
+            schedule_plans.append(("Вариант из ML-симуляции", ml_plan))
+        render_payment_calendar(case, budget_share, schedule_plans)
+
+    with stress_tab:
+        st.caption(f"{shown_plan.title}. Проверяем платёж при снижении дохода или росте расходов.")
+        st.table(
+            [
+                {
+                    "Сценарий": check.name,
+                    "Результат": "Проходит" if check.passed else "Не проходит",
+                    "Наибольшая нехватка": (
+                        "—" if check.passed else f"Месяц {check.shortfall_month} · {money(check.shortfall)}"
+                    ),
+                }
+                for check in stress_details(case, shown_plan, budget_share)
+            ],
+            hide_index=True,
+            alt="Результаты четырёх стресс-проверок по рассматриваемому графику",
+        )
+
+    with plans_tab:
+        st.caption("Полный отчёт включает исходные условия, все рассчитанные варианты и помесячный бюджет.")
         st.download_button(
             "Скачать полный перебор (JSON)",
-            data=build_case_report(
-                case,
-                plans,
-                objective,
-                budget_share,
-                max_extension_months,
-                max_grace_months,
+            data=partial(
+                build_case_report, case, plans, objective, budget_share, max_extension_months, max_grace_months,
+                review_plan_key=selected.key if selected else None,
             ),
             file_name=f"qaryzflow_{case.case_id.lower()}_schedule_search.json",
             mime="application/json",
             key=f"download_{case.case_id}",
+            on_click="ignore",
+            icon=":material/download:",
         )
+        if eligible:
+            st.dataframe(
+                [
+                    {
+                        "График": plan.title,
+                        "Макс. платёж, ₸": round(plan.peak_monthly_payment),
+                        "Всего выплат, ₸": round(plan.total_repayment),
+                        "Стресс-проверки": f"{plan.stress_passes}/{plan.stress_total}",
+                        "Лучший компромисс": "Да" if plan.is_pareto_optimal else "—",
+                        "Для обсуждения": "Выбран" if selected and plan.key == selected.key else "—",
+                    }
+                    for plan in eligible
+                ],
+                width="stretch",
+                hide_index=True,
+                alt="Все графики, прошедшие помесячную бюджетную проверку",
+            )
+        else:
+            st.info("При этих условиях допустимых графиков нет.")
 
 
 def render_portfolio_page(
@@ -444,10 +556,6 @@ def render_portfolio_page(
         average_reduction = 0.0
         average_stress = 0.0
 
-    render_header(
-        "Портфель учебных кейсов",
-        "Проверка поискового алгоритма на шести вымышленных профилях. Сводка меняется вместе с настройками подбора.",
-    )
     a, b, c, d = st.columns(4)
     a.metric("Вымышленные кейсы", str(len(summary)))
     b.metric("С доступным графиком", f"{len(feasible)} из {len(summary)}")
@@ -497,7 +605,7 @@ def render_portfolio_page(
 
     st.write("")
     st.markdown(
-        '<div class="callout"><strong>Как читать:</strong> показатели относятся только к шести синтетическим профилям и не описывают банковский портфель. Если график не проходит бюджетный лимит, приложение не считает его рекомендацией. Для банка эффект нужно измерять на разрешённых исторических данных.</div>',
+        '<div class="callout"><strong>Как читать:</strong> показатели относятся к учебным профилям. В сводке показаны варианты, прошедшие бюджетный лимит для заданных условий.</div>',
         unsafe_allow_html=True,
     )
 
@@ -518,10 +626,6 @@ def render_optimizer_page(
     feasible_count = sum(plan.is_feasible for plan in plans)
     frontier_count = sum(plan.is_pareto_optimal for plan in plans)
 
-    render_header(
-        "Оптимизатор и контроль",
-        "Расчёт графиков основан на явных формулах и ограничениях. Вероятность просрочки не моделируется.",
-    )
     a, b, c, d = st.columns(4)
     a.metric("Перебрано графиков", str(len(plans)))
     b.metric("Проходят бюджетный лимит", str(feasible_count))
@@ -533,9 +637,9 @@ def render_optimizer_page(
         with st.container(border=True):
             st.markdown('<div class="panel-title">Как подбирается график</div>', unsafe_allow_html=True)
             steps = [
-                ("01", "Обновить бюджет", "Обычный доход уменьшается на указанный процент; вычитаются обязательные расходы и прочие платежи."),
+                ("01", "Рассчитать бюджет по месяцам", "Доход меняется по сценарию восстановления. Из него вычитаются обязательные расходы и прочие платежи."),
                 ("02", "Перебрать условия", "Проверяются сроки с шагом в один месяц, заданная длина паузы и максимальное продление."),
-                ("03", "Отсеять недоступные", f"Остаются планы с платежом не выше {budget_share:.0%} свободного бюджета."),
+                ("03", "Отсеять недоступные", f"В каждом месяце платёж должен укладываться в {budget_share:.0%} свободного бюджета этого месяца."),
                 ("04", "Показать компромисс", "Сравниваются ежемесячный платёж, сумма выплат и устойчивость к четырём заданным изменениям бюджета."),
             ]
             for number, title, description in steps:
@@ -572,7 +676,7 @@ def render_optimizer_page(
         ]
         st.dataframe(stress_rows, width="stretch", hide_index=True)
 
-    with st.expander("Стенд на шести вымышленных профилях", expanded=False):
+    with st.expander("Стенд на вымышленных профилях", expanded=False):
         benchmark_rows = []
         for demo_case in CASES:
             demo_plans = make_plans(
@@ -601,7 +705,7 @@ def render_optimizer_page(
     st.markdown(
         """
         <div class="callout">
-          <strong>Границы демо.</strong> Основной подбор не использует обученную банковскую модель риска. Отдельная ML-лаборатория обучается только на искусственных примерах и не влияет на этот результат. Не учитываются комиссии, страховки, юридические ограничения, кредитная политика и особенности договоров. Снижение дохода считается от введённого обычного чистого дохода. Все выводы относятся только к вымышленным профилям; сотрудник и правила банка остаются решающими.
+          <strong>Границы демо.</strong> Основной подбор выполняется по формулам и заданной цели. Сравнение с ML в карточке и лаборатории использует искусственные примеры. Расчёт упрощает договор до долга, ставки, срока и платежей. Снижение дохода считается от введённого обычного чистого дохода. Выводы относятся к вымышленным профилям.
         </div>
         """,
         unsafe_allow_html=True,
@@ -615,10 +719,6 @@ def render_ml_lab_page(
     max_extension_months: int,
     max_grace_months: int,
 ) -> None:
-    render_header(
-        "ML-лаборатория",
-        "Сравните две модели, проверьте их на более поздней синтетической когорте и посмотрите, как меняется ранжирование графиков.",
-    )
     st.warning(
         "Все записи, целевые метки и результаты ниже искусственные. Эта лаборатория показывает процесс проверки ML-модели; её оценки нельзя переносить на клиентов или портфель банка."
     )
@@ -635,7 +735,7 @@ def render_ml_lab_page(
         seed = seed_column.number_input(
             "Seed генератора",
             min_value=0,
-            max_value=2_147_483_647,
+            max_value=MAX_SEED,
             value=DEFAULT_SEED,
             step=1,
             help="При одинаковом seed синтетические данные и результаты повторяются.",
@@ -658,14 +758,7 @@ def render_ml_lab_page(
         max_extension_months=max_extension_months,
         max_grace_months=max_grace_months,
     )
-    scored_plans = sorted(
-        (
-            (score_plan(model, case, plan, selected_model_key), plan)
-            for plan in plans
-            if plan.is_feasible
-        ),
-        key=lambda item: (-item[0], item[1].term_months, item[1].grace_months),
-    )
+    scored_plans = rank_feasible_plans(model, case, plans, selected_model_key)
     rule_plan = choose_plan(plans, objective)
 
     a, b, c, d = st.columns(4)
@@ -674,8 +767,21 @@ def render_ml_lab_page(
     c.metric("Будущая контрольная когорта", f"{model.rows_test:,}".replace(",", " "))
     d.metric("ROC-AUC выбранной модели", f"{selected_model.roc_auc:.3f}", "только симуляция")
     st.caption(
-        f"Первые 80% записей используются для обучения, последние 20% — как имитация будущего периода с более напряжёнными условиями. Seed: {model.seed}. Доля метки «успех» меняется с {model.train_success_share:.1%} в обучении до {model.test_success_share:.1%} в контрольной когорте."
+        f"Доля графиков без пропусков платежей — {model.train_success_share:.1%} в обучении и {model.test_success_share:.1%} в поздней проверке. Seed {model.seed}."
     )
+    with st.expander("Как получены данные и исходы"):
+        st.write(
+            f"Каждая запись содержит вымышленный бюджет и рассчитанный из долга, ставки, срока и паузы платёж. "
+            f"В симуляции меняются доходы, расходы и время начала восстановления. Успех означает, что заёмщик внёс "
+            f"первые {OBSERVED_PAYMENTS} плановых платежей полностью и вовремя, либо все платежи, если их меньше. "
+            "Нехватка в платёжном месяце расходует резерв. Поздние 20% записей имитируют период с меньшими резервами и более частыми отклонениями бюджета."
+        )
+        st.dataframe(
+            list(model.scenario_summary),
+            width="stretch",
+            hide_index=True,
+            alt="Состав обучающей и поздней выборок по траектории дохода",
+        )
 
     st.subheader("Сравнение качества на отложенном синтетическом периоде")
     comparison_rows = [
@@ -690,7 +796,7 @@ def render_ml_lab_page(
     ]
     st.dataframe(comparison_rows, width="stretch", hide_index=True)
     st.caption(
-        "В таблице есть простой базовый уровень (частота успеха). ROC-AUC оценивает ранжирование; average precision (AP) учитывает точность и полноту положительного класса; Brier и log loss оценивают вероятностные прогнозы."
+        "Сравните полные модели с двумя ориентирами. Один учитывает только долю платежа в бюджете, другой выдаёт одну и ту же долю успеха для всех графиков. ROC-AUC и AP оценивают ранжирование, Brier и log loss — точность учебных вероятностных оценок."
     )
 
     left, right = st.columns([1, 1], gap="large")
@@ -748,7 +854,7 @@ def render_ml_lab_page(
             "1. Согласовать с банком событие, которое нужно прогнозировать, горизонт и момент принятия решения.\n"
             "2. Подготовить разрешённые признаки, доступные именно на дату решения; исключить утечку будущей информации.\n"
             "3. Сравнить модели на временном holdout и с базовым процессом, проверить калибровку и результат по рабочим сегментам.\n"
-            "4. Провести независимую проверку, теневое наблюдение и согласовать мониторинг до любого применения."
+            "4. Независимо проверить качество модели и согласовать мониторинг до применения."
         )
 
     st.write("")
@@ -787,8 +893,9 @@ def render_ml_lab_page(
         else:
             st.info("Для текущих ограничений нет графиков, проходящих бюджетный лимит; модель не ранжирует недопустимые варианты.")
 
-    with st.expander("Примеры искусственных строк контрольной выборки", expanded=False):
-        st.dataframe(list(model.holdout_examples), width="stretch", hide_index=True)
+    with st.expander("Примеры графиков и исходов в контрольной выборке", expanded=False):
+        st.caption("Месяц первого пропуска считается от начала графика. Нехватка показывает неоплаченную часть платежа в этом месяце.")
+        st.dataframe(list(model.holdout_examples), width="stretch", hide_index=True, alt="Примеры рассчитанных платежей и пропусков в поздней симуляции")
 
     st.markdown(
         '<div class="callout"><strong>Что означает качество на экране:</strong> ROC-AUC и Brier score измерены на отложенной части той же искусственно сгенерированной выборки. Они показывают, что код обучения и оценки работает на заданной симуляции; это не свидетельство точности, пользы или справедливости модели для клиентов банка.</div>',
@@ -796,183 +903,193 @@ def render_ml_lab_page(
     )
 
 
+def reset_case_inputs(case_id: str) -> None:
+    fields = (
+        "income", "expenses", "other", "savings", "drop", "recovery", "recovery_wait",
+        "balance", "payment", "rate", "term", "overdue", "review_plan", "calendar_full",
+    )
+    for field in fields:
+        st.session_state.pop(f"{field}_{case_id}", None)
+
+
+def render_workspace_inputs(primary: bool) -> tuple[BorrowerCase, str, float, int, int]:
+    cases = {case.case_id: case for case in CASES}
+    if primary:
+        st.subheader("1. Выберите кейс и условия", anchor=False)
+    case_id = st.selectbox(
+        "Учебный кейс",
+        options=list(cases),
+        index=list(cases).index("Q-1176"),
+        format_func=lambda key: cases[key].label,
+        key="case_selector",
+    )
+    base = cases[case_id]
+    st.caption(f"{base.region} · {base.segment} · вымышленный профиль")
+    if primary and base.demo_note:
+        st.caption(f"Подсказка к исходному кейсу. {base.demo_note}")
+
+    settings = st.expander("Изменить условия") if primary else st.container()
+    with settings:
+        st.caption("После изменения значения расчёт обновляется сразу.")
+        budget_tab, loan_tab, search_tab = st.tabs(["Доход и расходы", "Кредит", "Параметры подбора"])
+        with budget_tab:
+            amounts, recovery = st.columns(2)
+            with amounts:
+                st.markdown("**Ежемесячный бюджет**")
+                income = st.number_input(
+                    "Доход до снижения, ₸", 50_000, 5_000_000, int(base.income), 10_000,
+                    key=f"income_{case_id}", persist_state="session",
+                )
+                essential_expenses = st.number_input(
+                    "Обязательные расходы, ₸", 30_000, 3_000_000, int(base.essential_expenses), 5_000,
+                    key=f"expenses_{case_id}", persist_state="session",
+                )
+                other_debt = st.number_input(
+                    "Платежи по другим долгам, ₸", 0, 2_000_000, int(base.other_debt_payment), 5_000,
+                    key=f"other_{case_id}", persist_state="session",
+                )
+                savings = st.number_input(
+                    "Денежный резерв, ₸", 0, 20_000_000, int(base.savings), 10_000,
+                    key=f"savings_{case_id}", persist_state="session",
+                    help="Резерв учитывается в учебной ML-симуляции.",
+                )
+            with recovery:
+                st.markdown("**Как меняется доход**")
+                income_drop_pct = st.slider(
+                    "Снижение дохода", 0, 70, round(base.income_drop * 100), 1,
+                    format="%d%%", key=f"drop_{case_id}", persist_state="session",
+                )
+                first_income = input_number(income, base.income) * (1 - income_drop_pct / 100)
+                st.caption(f"Доход в первый месяц — {money(first_income)}.")
+                recovery_months = st.slider(
+                    "За сколько месяцев восстановится доход", 0, 12, base.income_recovery_months, 1,
+                    key=f"recovery_{case_id}", persist_state="session",
+                    help="При 0 доход остаётся сниженным на весь срок.",
+                )
+                recovery_wait_months = st.slider(
+                    "Месяцев со сниженным доходом до начала роста", 1, 12, base.income_recovery_wait_months, 1,
+                    key=f"recovery_wait_{case_id}", persist_state="session",
+                    disabled=recovery_months == 0 or income_drop_pct == 0,
+                )
+
+        with loan_tab:
+            debt, term = st.columns(2)
+            with debt:
+                balance = st.number_input(
+                    "Остаток долга, ₸", 50_000, 50_000_000, int(base.balance), 50_000,
+                    key=f"balance_{case_id}", persist_state="session",
+                )
+                current_payment = st.number_input(
+                    "Текущий платёж в месяц, ₸", 5_000, 2_000_000, int(base.current_payment), 5_000,
+                    key=f"payment_{case_id}", persist_state="session",
+                )
+                annual_rate = st.slider(
+                    "Номинальная годовая ставка", 0.0, 45.0, float(base.annual_rate), 0.5,
+                    format="%.1f%%", key=f"rate_{case_id}", persist_state="session",
+                )
+            with term:
+                remaining_months = st.slider(
+                    "Осталось месяцев по договору", 3, 84, base.remaining_months, 1,
+                    key=f"term_{case_id}", persist_state="session",
+                )
+                overdue_months = st.slider(
+                    "Месяцев текущей просрочки", 0, 6, base.overdue_months, 1,
+                    key=f"overdue_{case_id}", persist_state="session",
+                )
+
+        with search_tab:
+            limits, timing = st.columns(2)
+            with limits:
+                objective = st.selectbox(
+                    "Предложение по умолчанию",
+                    options=list(OBJECTIVES),
+                    format_func=OBJECTIVES.__getitem__,
+                    key="schedule_objective",
+                    help="Этот приоритет применяется, пока график не выбран вручную.",
+                )
+                budget_share_pct = st.slider(
+                    "Доля свободного бюджета на платёж", 40, 100, 80, 5, format="%d%%",
+                    key="budget_share",
+                    help="С этой долей сравнивается платёж в каждом месяце.",
+                )
+            with timing:
+                max_extension_months = st.slider(
+                    "На сколько месяцев можно продлить срок", 0, 60, 48, 1, key="max_extension_months",
+                    help="Продление прибавляется к оставшемуся сроку договора.",
+                )
+                max_grace_months = st.slider(
+                    "Максимальная пауза, месяцев", 0, 6, 3, 1,
+                    help="Во время паузы платежей нет, а проценты добавляются к долгу.",
+                )
+
+        st.button(
+            "Вернуть исходные данные кейса",
+            on_click=reset_case_inputs,
+            args=(case_id,),
+            key=f"reset_case_{case_id}",
+            help="Сбросит правки бюджета, кредита и ручной выбор для этого кейса.",
+        )
+
+    scenario_case = replace(
+        base,
+        income=input_number(income, base.income),
+        income_drop=float(income_drop_pct) / 100,
+        income_recovery_months=int(recovery_months),
+        income_recovery_wait_months=int(recovery_wait_months),
+        balance=input_number(balance, base.balance),
+        current_payment=input_number(current_payment, base.current_payment),
+        other_debt_payment=input_number(other_debt, base.other_debt_payment),
+        essential_expenses=input_number(essential_expenses, base.essential_expenses),
+        savings=input_number(savings, base.savings),
+        overdue_months=int(overdue_months),
+        remaining_months=int(remaining_months),
+        annual_rate=input_number(annual_rate, base.annual_rate),
+    )
+    if income_drop_pct > 0:
+        if recovery_months == 0:
+            st.caption("По сценарию доход остаётся сниженным на весь срок.")
+        else:
+            st.caption(
+                f"По сценарию доход начинает расти в месяце {recovery_wait_months + 1} "
+                f"и восстанавливается в месяце {recovery_wait_months + recovery_months}."
+            )
+    return scenario_case, cast(str, objective), float(budget_share_pct) / 100, max_extension_months, max_grace_months
+
+
+PAGE_HEADERS = {
+    "Подбор графика": ("Подбор графика", "Сравните варианты реструктуризации по платежу, общей сумме и запасу бюджета."),
+    "Проверка проекта": ("Проверка проекта", "Посмотрите сводку кейсов, правила расчёта и результаты учебного ML-эксперимента."),
+}
+
 with st.sidebar:
     st.markdown(
         '<div class="brand"><div class="brand-mark">Q</div><div><div class="brand-name">qaryzflow</div><div class="brand-caption">графики урегулирования</div></div></div>',
         unsafe_allow_html=True,
     )
-    page = st.radio(
-        "Раздел",
-        ["Кейс клиента", "Портфель", "Оптимизатор и контроль", "ML-лаборатория"],
-        label_visibility="collapsed",
-    )
-    st.divider()
-    st.markdown('<div class="sidebar-section">УЧЕБНЫЙ ПРОФИЛЬ</div>', unsafe_allow_html=True)
-    selected_case_id = st.selectbox(
-        "Демо-кейс",
-        options=[case.case_id for case in CASES],
-        format_func=lambda value: next(case.label for case in CASES if case.case_id == value),
-        label_visibility="collapsed",
-    )
-    base_case = next(case for case in CASES if case.case_id == selected_case_id)
-    st.markdown(
-        f'<div class="tiny-note" style="color:#a7c4b9;margin:.2rem 0 1rem">{base_case.region} · {base_case.segment} · вымышленный профиль</div>',
-        unsafe_allow_html=True,
-    )
+    page = st.radio("Раздел", list(PAGE_HEADERS), key="page")
+    st.caption("Локальный режим · вымышленные данные")
 
-    with st.expander("Настройки подбора", expanded=True):
-        objective = st.selectbox(
-            "Приоритет",
-            options=list(OBJECTIVES),
-            format_func=lambda key: OBJECTIVES[key],
-            help="Сравнение выполняется только среди графиков, прошедших бюджетный лимит.",
-        )
-        budget_share_pct = st.slider(
-            "Лимит платежа от свободного бюджета",
-            40,
-            100,
-            80,
-            5,
-            help="Графики выше лимита не считаются подходящими.",
-        )
-        max_extension_months = st.slider("Максимальное продление срока, мес.", 0, 60, 48, 1)
-        max_grace_months = st.slider("Максимальная пауза, мес.", 0, 6, 3, 1)
-
-    with st.expander("Данные учебного профиля", expanded=(page == "Кейс клиента")):
-        st.markdown('<div class="sidebar-section">Доход и бюджет</div>', unsafe_allow_html=True)
-        income = st.number_input(
-            "Обычный чистый доход в месяц",
-            50_000,
-            5_000_000,
-            int(base_case.income),
-            10_000,
-            key=f"income_{base_case.case_id}",
-        )
-        income_drop_pct = st.slider(
-            "Снижение дохода",
-            0,
-            70,
-            int(base_case.income_drop * 100),
-            1,
-            key=f"drop_{base_case.case_id}",
-        )
-        st.caption(f"Доход после снижения: {money(income * (1 - income_drop_pct / 100), compact=True)}")
-        essential_expenses = st.number_input(
-            "Обязательные расходы",
-            30_000,
-            3_000_000,
-            int(base_case.essential_expenses),
-            5_000,
-            key=f"expenses_{base_case.case_id}",
-        )
-        other_debt = st.number_input(
-            "Платежи по другим долгам",
-            0,
-            2_000_000,
-            int(base_case.other_debt_payment),
-            5_000,
-            key=f"other_{base_case.case_id}",
-        )
-        savings = st.number_input(
-            "Доступный резерв",
-            0,
-            20_000_000,
-            int(base_case.savings),
-            10_000,
-            key=f"savings_{base_case.case_id}",
-        )
-        st.markdown('<div class="sidebar-section">Условия долга</div>', unsafe_allow_html=True)
-        balance = st.number_input(
-            "Остаток долга",
-            50_000,
-            50_000_000,
-            int(base_case.balance),
-            50_000,
-            key=f"balance_{base_case.case_id}",
-        )
-        current_payment = st.number_input(
-            "Текущий ежемесячный платёж",
-            5_000,
-            2_000_000,
-            int(base_case.current_payment),
-            5_000,
-            key=f"payment_{base_case.case_id}",
-        )
-        annual_rate = st.slider(
-            "Номинальная годовая ставка",
-            0.0,
-            45.0,
-            float(base_case.annual_rate),
-            0.5,
-            key=f"rate_{base_case.case_id}",
-        )
-        remaining_months = st.slider(
-            "Осталось месяцев по договору",
-            3,
-            84,
-            base_case.remaining_months,
-            1,
-            key=f"term_{base_case.case_id}",
-        )
-        overdue_months = st.slider(
-            "Месяцы текущей просрочки",
-            0,
-            6,
-            base_case.overdue_months,
-            1,
-            key=f"overdue_{base_case.case_id}",
-        )
-
-    scenario_case = replace(
-        base_case,
-        income=input_number(income, base_case.income),
-        income_drop=float(income_drop_pct) / 100.0,
-        balance=input_number(balance, base_case.balance),
-        current_payment=input_number(current_payment, base_case.current_payment),
-        other_debt_payment=input_number(other_debt, base_case.other_debt_payment),
-        essential_expenses=input_number(essential_expenses, base_case.essential_expenses),
-        savings=input_number(savings, base_case.savings),
-        overdue_months=int(overdue_months),
-        remaining_months=int(remaining_months),
-        annual_rate=input_number(annual_rate, base_case.annual_rate),
-    )
-    budget_share = float(budget_share_pct) / 100.0
-    st.divider()
-    st.markdown('<span class="status-pill"><span class="status-dot"></span>Локальный демо-режим</span>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="tiny-note" style="color:#a7c4b9;margin-top:12px">Внешние сервисы и реальные клиентские данные не используются.</div>',
-        unsafe_allow_html=True,
-    )
-
-
-if page == "Кейс клиента":
-    render_case_page(
-        scenario_case,
-        objective,
-        budget_share,
-        max_extension_months,
-        max_grace_months,
-    )
-elif page == "Портфель":
-    render_portfolio_page(
-        objective,
-        budget_share,
-        max_extension_months,
-        max_grace_months,
-    )
-elif page == "Оптимизатор и контроль":
-    render_optimizer_page(
-        scenario_case,
-        objective,
-        budget_share,
-        max_extension_months,
-        max_grace_months,
-    )
+render_header(*PAGE_HEADERS[page])
+if page == "Подбор графика":
+    render_case_page(*render_workspace_inputs(primary=True))
 else:
-    render_ml_lab_page(
-        scenario_case,
-        objective,
-        budget_share,
-        max_extension_months,
-        max_grace_months,
+    section = st.segmented_control(
+        "Что проверить",
+        ["Портфель", "Как считается", "ML-лаборатория"],
+        default="Портфель",
+        required=True,
+        key="project_section",
+        persist_state="session",
+        width="stretch",
     )
+    with st.expander("Исходные данные и настройки"):
+        if section == "Портфель":
+            st.caption("Для портфеля применяются общие параметры подбора. У каждого профиля свой исходный бюджет.")
+        workspace = render_workspace_inputs(primary=False)
+
+    if section == "Портфель":
+        render_portfolio_page(*workspace[1:])
+    elif section == "Как считается":
+        render_optimizer_page(*workspace)
+    else:
+        render_ml_lab_page(*workspace)

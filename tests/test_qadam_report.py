@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 
 from qadam_engine import CASES, make_plans
-from qadam_report import build_case_report
+from qadam_report import build_case_report, build_review_summary
 
 
 class CaseReportTests(unittest.TestCase):
@@ -11,7 +11,8 @@ class CaseReportTests(unittest.TestCase):
         case = replace(
             CASES[0],
             income=1_000_000,
-            income_drop=0.0,
+            income_drop=0.25,
+            income_recovery_months=1,
             balance=12_000,
             annual_rate=12.0,
             current_payment=1_000,
@@ -37,7 +38,10 @@ class CaseReportTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(report["schema_version"], "2.1")
+        self.assertEqual(report["schema_version"], "2.3")
+        self.assertEqual(len(report["monthly_budget"]), 14)
+        self.assertEqual([month["income"] for month in report["monthly_budget"][:2]], [750_000, 1_000_000])
+        self.assertEqual(report["monthly_budget"][0]["payment_limit"], 650_000)
         self.assertEqual(len(report["amortization_schedules"]["current"]), 2)
         self.assertIsNotNone(report["recommendation"])
         self.assertNotEqual(report["recommendation"]["key"], "current")
@@ -74,6 +78,23 @@ class CaseReportTests(unittest.TestCase):
         self.assertIsNone(report["recommendation"])
         self.assertIsNone(report["amortization_schedules"]["recommended"])
         self.assertEqual(len(report["amortization_schedules"]["current"]), case.remaining_months)
+        self.assertIsNone(report["selected_for_review"])
+
+    def test_exports_manually_selected_graph_separately_from_recommendation(self) -> None:
+        case = CASES[3]
+        plans = make_plans(case)
+        key = "term-67-grace-0"
+        selected = next(plan for plan in plans if plan.key == key)
+        report = json.loads(build_case_report(case, plans, "cost", 0.8, 48, 3, review_plan_key=key))
+        self.assertEqual(report["recommendation"]["key"], "term-30-grace-0")
+        self.assertEqual(report["selected_for_review"]["key"], key)
+        self.assertEqual(len(report["amortization_schedules"]["selected_for_review"]), 67)
+        self.assertEqual(len(report["selected_stress_checks"]), 4)
+        summary = build_review_summary(case, plans[0], selected, 0.8)
+        self.assertIn("Срок 67 мес.", summary)
+        self.assertIn("32 596 ₸", summary)
+        with self.assertRaises(ValueError):
+            build_case_report(case, plans, "cost", 0.8, 48, 3, review_plan_key="current")
 
 
 if __name__ == "__main__":

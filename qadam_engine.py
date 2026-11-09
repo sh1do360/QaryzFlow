@@ -7,6 +7,7 @@ not estimate default probabilities or make decisions about real customers.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import fsum
 from typing import TypedDict
 
 
@@ -26,6 +27,9 @@ class BorrowerCase:
     remaining_months: int
     overdue_months: int
     savings: float
+    income_recovery_months: int = 0
+    income_recovery_wait_months: int = 1
+    demo_note: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,7 +53,26 @@ class Plan:
     stress_passes: int
     stress_total: int
     stress_results: tuple[tuple[str, bool], ...]
+    budget_check_month: int
+    budget_check_payment: float
+    budget_margin: float
     is_pareto_optimal: bool = False
+
+
+@dataclass(frozen=True)
+class BudgetMonth:
+    month: int
+    income: float
+    free_cash: float
+    payment_limit: float
+
+
+@dataclass(frozen=True)
+class StressCheck:
+    name: str
+    passed: bool
+    shortfall_month: int | None = None
+    shortfall: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -81,12 +104,47 @@ class PortfolioItem(TypedDict):
 
 
 CASES: tuple[BorrowerCase, ...] = (
-    BorrowerCase("Q-1042", "Клиент Q-1042", "Наёмный сотрудник", "Алматы", 420_000, 0.22, 1_850_000, 22.5, 131_000, 95_000, 180_000, 26, 2, 130_000),
-    BorrowerCase("Q-1088", "Клиент Q-1088", "Микропредприниматель", "Шымкент", 310_000, 0.06, 950_000, 26.5, 65_000, 48_000, 150_000, 18, 1, 300_000),
-    BorrowerCase("Q-1121", "Клиент Q-1121", "Наёмный сотрудник", "Астана", 680_000, 0.10, 3_200_000, 21.0, 198_000, 112_000, 250_000, 30, 3, 500_000),
-    BorrowerCase("Q-1176", "Клиент Q-1176", "Самозанятый", "Караганда", 410_000, 0.33, 1_200_000, 23.9, 104_000, 62_000, 145_000, 19, 4, 25_000),
-    BorrowerCase("Q-1204", "Клиент Q-1204", "Наёмный сотрудник", "Актобе", 540_000, 0.00, 2_400_000, 19.9, 118_000, 210_000, 220_000, 27, 1, 420_000),
-    BorrowerCase("Q-1249", "Клиент Q-1249", "Микропредприниматель", "Тараз", 390_000, 0.13, 1_500_000, 24.0, 95_000, 80_000, 175_000, 21, 2, 160_000),
+    BorrowerCase(
+        "Q-1042", "Q-1042 · Высокая нагрузка", "Наёмный сотрудник", "Алматы", 420_000, 0.22, 1_850_000, 22.5, 131_000, 95_000, 180_000, 26, 2, 130_000,
+        demo_note="Свободный бюджет положительный, но лимит слишком мал для нового платежа. Попробуйте изменить срок поиска или долю бюджета.",
+    ),
+    BorrowerCase(
+        "Q-1088", "Q-1088 · Небольшое падение дохода", "Микропредприниматель", "Шымкент", 310_000, 0.06, 950_000, 26.5, 65_000, 48_000, 150_000, 18, 1, 300_000,
+        demo_note="Доход немного снизился. Сравните, сколько стоит уменьшение ежемесячного платежа за счёт продления срока.",
+    ),
+    BorrowerCase(
+        "Q-1121", "Q-1121 · Крупный остаток долга", "Наёмный сотрудник", "Астана", 680_000, 0.10, 3_200_000, 21.0, 198_000, 112_000, 250_000, 30, 3, 500_000,
+        demo_note="Нагрузка складывается из большого остатка и платежей по другим обязательствам. Сопоставьте цель по стоимости и по устойчивости.",
+    ),
+    BorrowerCase(
+        "Q-1176", "Q-1176 · Сценарии восстановления", "Самозанятый", "Караганда", 410_000, 0.33, 1_200_000, 23.9, 104_000, 62_000, 145_000, 19, 4, 25_000,
+        demo_note="Основной пример для показа. Установите три шага восстановления дохода и сравните рост со второго и с четвёртого месяца.",
+    ),
+    BorrowerCase(
+        "Q-1204", "Q-1204 · Другие обязательства", "Наёмный сотрудник", "Актобе", 540_000, 0.00, 2_400_000, 19.9, 118_000, 210_000, 220_000, 27, 1, 420_000,
+        demo_note="Доход стабилен, а бюджет сжимают выплаты по другим долгам. Посмотрите, как они меняют доступный платёж.",
+    ),
+    BorrowerCase(
+        "Q-1249", "Q-1249 · Стоимость или запас", "Микропредприниматель", "Тараз", 390_000, 0.13, 1_500_000, 24.0, 95_000, 80_000, 175_000, 21, 2, 160_000,
+        demo_note="Сравните дешёвый график с графиком, который оставляет больший запас при росте расходов.",
+    ),
+    BorrowerCase(
+        "Q-1301", "Q-1301 · Пауза при позднем восстановлении", "Самозанятый", "Усть-Каменогорск", 430_000, 0.35, 900_000, 18.0, 76_000, 75_000, 170_000, 14, 1, 65_000,
+        income_recovery_months=3, income_recovery_wait_months=3,
+        demo_note="Доход остаётся сниженным три месяца, затем постепенно растёт. Проверьте, какой срок и пауза подходят при такой траектории.",
+    ),
+    BorrowerCase(
+        "Q-1320", "Q-1320 · Крупный последний платёж", "Наёмный сотрудник", "Павлодар", 255_000, 0.00, 550_000, 16.5, 22_000, 38_000, 145_000, 12, 0, 85_000,
+        demo_note="Текущий регулярный платёж доступен, но в конце остаётся крупный остаток. Откройте весь календарь и сравните с пересчётом на те же 12 месяцев.",
+    ),
+    BorrowerCase(
+        "Q-1334", "Q-1334 · Дефицит даже в паузу", "Наёмный сотрудник", "Костанай", 300_000, 0.30, 720_000, 20.0, 48_000, 52_000, 188_000, 18, 2, 20_000,
+        demo_note="Доход уже ниже обязательных расходов и других платежей. Пауза по этому кредиту сама по себе не закрывает нехватку средств.",
+    ),
+    BorrowerCase(
+        "Q-1370", "Q-1370 · Нулевая ставка и запас", "Наёмный сотрудник", "Петропавловск", 320_000, 0.00, 360_000, 0.0, 30_000, 20_000, 160_000, 12, 0, 240_000,
+        demo_note="Текущий график проходит бюджет и все стресс-проверки. При нулевой ставке продление меняет срок и платёж, сохраняя сумму выплат.",
+    ),
 )
 
 
@@ -105,15 +163,39 @@ STRESS_SCENARIOS: tuple[tuple[str, float, float], ...] = (
 )
 
 
-def effective_income(case: BorrowerCase) -> float:
-    """Apply the entered income decline to the usual monthly income."""
+def effective_income(case: BorrowerCase, month: int = 1) -> float:
+    """Start at the reduced income and recover linearly when requested."""
     drop = max(0.0, min(0.80, float(case.income_drop)))
+    recovery = max(0, int(case.income_recovery_months))
+    if recovery:
+        wait = max(1, int(case.income_recovery_wait_months))
+        drop *= 1.0 - min(max(0, month - wait), recovery) / recovery
     return max(0.0, float(case.income)) * (1.0 - drop)
 
 
 def free_cash(case: BorrowerCase) -> float:
-    """Monthly income left after essential expenses and other debt payments."""
+    """First month's income left after essential expenses and other debts."""
     return effective_income(case) - max(0.0, case.essential_expenses) - max(0.0, case.other_debt_payment)
+
+
+def monthly_budget(
+    case: BorrowerCase,
+    budget_share: float,
+    horizon: int,
+    *,
+    income_shock: float = 0.0,
+    expense_shock: float = 0.0,
+) -> list[BudgetMonth]:
+    """Compute the payment limit in each month of the assumed income path."""
+    share = max(0.0, min(1.0, float(budget_share)))
+    expenses = max(0.0, case.essential_expenses) * (1.0 + expense_shock)
+    other_debt = max(0.0, case.other_debt_payment)
+    rows: list[BudgetMonth] = []
+    for month in range(1, horizon + 1):
+        income = effective_income(case, month) * (1.0 - income_shock)
+        cash = income - expenses - other_debt
+        rows.append(BudgetMonth(month, income, cash, max(0.0, cash) * share))
+    return rows
 
 
 def annuity_payment(balance: float, annual_rate: float, months: int) -> float:
@@ -127,16 +209,28 @@ def annuity_payment(balance: float, annual_rate: float, months: int) -> float:
     return balance * monthly_rate * factor / (factor - 1.0)
 
 
-def _stress_results(case: BorrowerCase, payment: float, budget_share: float) -> tuple[tuple[str, bool], ...]:
-    starting_income = effective_income(case)
-    results: list[tuple[str, bool]] = []
-    for name, income_shock, expense_shock in STRESS_SCENARIOS:
-        stressed_income = starting_income * (1.0 - income_shock)
-        stressed_expenses = max(0.0, case.essential_expenses) * (1.0 + expense_shock)
-        stressed_cash = stressed_income - stressed_expenses - max(0.0, case.other_debt_payment)
-        allowed_payment = max(0.0, stressed_cash) * budget_share
-        results.append((name, stressed_cash >= 0.0 and payment <= allowed_payment + 0.01))
-    return tuple(results)
+def payment_after_grace(balance: float, annual_rate: float, term: int, grace: int) -> float:
+    """Level payment on a term that includes the initial payment pause."""
+    monthly_rate = max(0.0, float(annual_rate)) / 100.0 / 12.0
+    balance_after_grace = max(0.0, balance) * (1.0 + monthly_rate) ** grace
+    return annuity_payment(balance_after_grace, annual_rate, term - grace)
+
+
+def _budget_margin(month: BudgetMonth, payment: float) -> float:
+    return month.payment_limit - payment + min(0.0, month.free_cash)
+
+
+def payment_within_limit(payment: float, limit: float) -> bool:
+    """Check the same one-cent payment tolerance in the engine and the calendar."""
+    return payment <= limit + 0.01
+
+
+def _fits_month(month: BudgetMonth, payment: float) -> bool:
+    return month.free_cash >= 0.0 and payment_within_limit(payment, month.payment_limit)
+
+
+def _passes_budget(budget: list[BudgetMonth], payments: list[float]) -> bool:
+    return all(_fits_month(month, payment) for month, payment in zip(budget, payments))
 
 
 def _make_plan(
@@ -146,76 +240,65 @@ def _make_plan(
     title: str,
     description: str,
     payment: float,
-    term_months: int,
     grace_months: int,
-    total_repayment: float,
-    budget_share: float,
+    payments: list[float],
+    budget: list[BudgetMonth],
+    stress_budgets: tuple[tuple[str, list[BudgetMonth]], ...],
     final_balance_payment: float = 0.0,
-    peak_monthly_payment: float | None = None,
 ) -> Plan:
-    cash = free_cash(case)
-    budget_limit = max(0.0, cash) * budget_share
-    peak_payment = (
-        payment + final_balance_payment
-        if peak_monthly_payment is None
-        else peak_monthly_payment
+    tightest_month, tightest_payment = min(
+        zip(budget, payments), key=lambda item: _budget_margin(*item)
     )
-    share = peak_payment / cash if cash > 0 else None
-    stress_results = _stress_results(case, peak_payment, budget_share)
+    margin = _budget_margin(tightest_month, tightest_payment)
+    paying_months = [(month, paid) for month, paid in zip(budget, payments) if paid > 0.0]
+    payment_share = None
+    if all(month.free_cash > 0.0 for month, _ in paying_months):
+        payment_share = max((paid / month.free_cash for month, paid in paying_months), default=None)
+    total_repayment = fsum(payments)
+    stress_results = tuple(
+        (name, _passes_budget(stressed_budget, payments))
+        for name, stressed_budget in stress_budgets
+    )
     return Plan(
         key=key,
         title=title,
         description=description,
         monthly_payment=payment,
-        peak_monthly_payment=peak_payment,
+        peak_monthly_payment=max(payments),
         grace_months=grace_months,
-        term_months=term_months,
-        months_with_payment=max(0, term_months - grace_months),
+        term_months=len(payments),
+        months_with_payment=len(paying_months),
         total_repayment=total_repayment,
         interest_cost=max(0.0, total_repayment - max(0.0, case.balance)),
         final_balance_payment=final_balance_payment,
-        monthly_cash_after_payment=cash - payment,
-        budget_limit=budget_limit,
-        payment_share_of_free_cash=share,
-        is_feasible=(cash >= 0.0 and peak_payment <= budget_limit + 0.01),
-        feasibility_gap=max(0.0, peak_payment - budget_limit),
+        monthly_cash_after_payment=min(month.free_cash - paid for month, paid in zip(budget, payments)),
+        budget_limit=tightest_month.payment_limit,
+        payment_share_of_free_cash=payment_share,
+        is_feasible=_passes_budget(budget, payments),
+        feasibility_gap=max(0.0, -margin),
         stress_passes=sum(passed for _, passed in stress_results),
         stress_total=len(stress_results),
         stress_results=stress_results,
+        budget_check_month=tightest_month.month,
+        budget_check_payment=tightest_payment,
+        budget_margin=margin,
     )
 
 
-def _current_plan(case: BorrowerCase, budget_share: float) -> Plan:
+def _current_payments(case: BorrowerCase, term_months: int) -> tuple[list[float], float]:
     """Keep the entered payment; show any residual balance as a final balloon."""
     balance = max(0.0, case.balance)
     monthly_rate = max(0.0, case.annual_rate) / 100.0 / 12.0
     payment = max(0.0, case.current_payment)
-    total_paid = 0.0
-    peak_payment = 0.0
-    term_months = max(1, int(case.remaining_months))
-    for month in range(1, term_months + 1):
+    payments: list[float] = []
+    for _ in range(term_months):
         due = balance * (1.0 + monthly_rate)
         paid = min(payment, due)
-        total_paid += paid
+        payments.append(paid)
         balance = max(0.0, due - paid)
-        peak_payment = max(peak_payment, paid)
-        if month == term_months:
-            final_payment = paid + balance
-            peak_payment = max(peak_payment, final_payment)
-    total_repayment = total_paid + balance
-    return _make_plan(
-        case,
-        key="current",
-        title="Текущий график",
-        description="Введённый платёж; возможный остаток долга показан как платёж в конце срока.",
-        payment=payment,
-        term_months=term_months,
-        grace_months=0,
-        total_repayment=total_repayment,
-        final_balance_payment=balance,
-        budget_share=budget_share,
-        peak_monthly_payment=peak_payment,
-    )
+    if payments:
+        payments[-1] += balance
+    return payments, balance
 
 
 def _mark_pareto_frontier(plans: list[Plan]) -> list[Plan]:
@@ -252,22 +335,38 @@ def make_plans(
     if case.remaining_months < 1:
         raise ValueError("Оставшийся срок должен быть не меньше одного месяца.")
 
-    budget_share = max(0.0, min(1.0, float(budget_share)))
     remaining = int(case.remaining_months)
     extension = max(0, int(max_extension_months))
     max_term = min(180, remaining + extension)
     max_grace = max(0, min(6, int(max_grace_months)))
-    monthly_rate = max(0.0, float(case.annual_rate)) / 100.0 / 12.0
-
-    plans = [_current_plan(case, budget_share)]
+    horizon = max(remaining, max_term)
+    budget = monthly_budget(case, budget_share, horizon)
+    stress_budgets = tuple(
+        (
+            name,
+            monthly_budget(case, budget_share, horizon, income_shock=income_shock, expense_shock=expense_shock),
+        )
+        for name, income_shock, expense_shock in STRESS_SCENARIOS
+    )
+    current_payments, final_balance = _current_payments(case, remaining)
+    plans = [
+        _make_plan(
+            case,
+            key="current",
+            title="Текущий график",
+            description="Введённый платёж; возможный остаток долга показан как платёж в конце срока.",
+            payment=max(0.0, case.current_payment),
+            grace_months=0,
+            payments=current_payments,
+            budget=budget,
+            stress_budgets=stress_budgets,
+            final_balance_payment=final_balance,
+        )
+    ]
     for term in range(remaining, max_term + 1):
         for grace in range(0, min(max_grace, term - 1) + 1):
-            if term == remaining and grace == 0:
-                continue
             payment_months = term - grace
-            balance_after_grace = max(0.0, case.balance) * ((1.0 + monthly_rate) ** grace)
-            payment = annuity_payment(balance_after_grace, case.annual_rate, payment_months)
-            total_repayment = payment * payment_months
+            payment = payment_after_grace(case.balance, case.annual_rate, term, grace)
             extension_label = f"+{term - remaining} мес. к сроку" if term > remaining else "срок без продления"
             pause_label = f"пауза {grace} мес." if grace else "без паузы"
             plans.append(
@@ -277,31 +376,29 @@ def make_plans(
                     title=f"Срок {term} мес. · {pause_label}",
                     description=f"{extension_label}; равный платёж после периода отсрочки.",
                     payment=payment,
-                    term_months=term,
                     grace_months=grace,
-                    total_repayment=total_repayment,
-                    budget_share=budget_share,
+                    payments=[0.0] * grace + [payment] * payment_months,
+                    budget=budget,
+                    stress_budgets=stress_budgets,
                 )
             )
     return _mark_pareto_frontier(plans)
 
 
-def _balanced_distance(plan: Plan, candidates: list[Plan]) -> float:
-    min_payment = min(item.peak_monthly_payment for item in candidates)
-    max_payment = max(item.peak_monthly_payment for item in candidates)
-    min_total = min(item.total_repayment for item in candidates)
-    max_total = max(item.total_repayment for item in candidates)
-    payment_position = (
-        (plan.peak_monthly_payment - min_payment) / (max_payment - min_payment)
-        if max_payment > min_payment
-        else 0.0
-    )
-    total_position = (
-        (plan.total_repayment - min_total) / (max_total - min_total)
-        if max_total > min_total
-        else 0.0
-    )
-    return (payment_position + total_position) / 2.0
+def _balanced_scores(plans: list[Plan], reference: list[Plan]) -> dict[str, float]:
+    if not reference:
+        return {}
+    min_payment = min(plan.peak_monthly_payment for plan in reference)
+    min_total = min(plan.total_repayment for plan in reference)
+    payment_range = max(plan.peak_monthly_payment for plan in reference) - min_payment
+    total_range = max(plan.total_repayment for plan in reference) - min_total
+    return {
+        plan.key: (
+            ((plan.peak_monthly_payment - min_payment) / payment_range if payment_range else 0.0)
+            + ((plan.total_repayment - min_total) / total_range if total_range else 0.0)
+        ) / 2.0
+        for plan in plans
+    }
 
 
 def sort_plans(plans: list[Plan], objective: str = "balanced") -> list[Plan]:
@@ -311,24 +408,34 @@ def sort_plans(plans: list[Plan], objective: str = "balanced") -> list[Plan]:
         feasible.sort(key=lambda plan: (plan.peak_monthly_payment, plan.total_repayment, plan.term_months, plan.grace_months))
         infeasible.sort(key=lambda plan: (plan.feasibility_gap, plan.peak_monthly_payment, plan.total_repayment))
     elif objective == "cost":
-        feasible.sort(key=lambda plan: (plan.total_repayment, plan.peak_monthly_payment, plan.term_months, plan.grace_months))
-        infeasible.sort(key=lambda plan: (plan.feasibility_gap, plan.total_repayment, plan.monthly_payment))
-    elif objective == "robust":
-        balanced_scores = {plan.key: _balanced_distance(plan, feasible) for plan in feasible}
         feasible.sort(
             key=lambda plan: (
-                -plan.stress_passes,
-                balanced_scores[plan.key],
+                round(plan.total_repayment, 2),
+                plan.key != "current",
+                round(plan.peak_monthly_payment, 2),
                 plan.term_months,
                 plan.grace_months,
             )
         )
-        infeasible.sort(key=lambda plan: (-plan.stress_passes, plan.feasibility_gap, plan.peak_monthly_payment))
+        infeasible.sort(key=lambda plan: (plan.feasibility_gap, plan.total_repayment, plan.monthly_payment))
     else:
-        feasible_scores = {plan.key: _balanced_distance(plan, feasible) for plan in feasible}
-        infeasible_scores = {plan.key: _balanced_distance(plan, infeasible) for plan in infeasible}
-        feasible.sort(key=lambda plan: (feasible_scores[plan.key], plan.term_months, plan.grace_months))
-        infeasible.sort(key=lambda plan: (plan.feasibility_gap, infeasible_scores[plan.key], plan.term_months))
+        frontier = [plan for plan in feasible if plan.is_pareto_optimal]
+        scores = _balanced_scores(feasible, frontier or feasible)
+        robust = objective == "robust"
+        feasible.sort(
+            key=lambda plan: (
+                -plan.stress_passes if robust else 0,
+                not plan.is_pareto_optimal,
+                scores[plan.key],
+                plan.term_months,
+                plan.grace_months,
+            )
+        )
+        if robust:
+            infeasible.sort(key=lambda plan: (-plan.stress_passes, plan.feasibility_gap, plan.peak_monthly_payment))
+        else:
+            infeasible_scores = _balanced_scores(infeasible, infeasible)
+            infeasible.sort(key=lambda plan: (plan.feasibility_gap, infeasible_scores[plan.key], plan.term_months))
     return feasible + infeasible
 
 
@@ -341,22 +448,27 @@ def objective_explanation(objective: str) -> str:
     if objective == "affordable":
         return "Среди графиков, укладывающихся в бюджетный лимит, выбран вариант с наименьшим максимальным платежом за месяц."
     if objective == "cost":
-        return "Среди графиков, укладывающихся в бюджетный лимит, выбран вариант с наименьшей общей суммой выплат."
+        return "Суммы выплат допустимых графиков сравниваются до 0,01 ₸. При равной минимальной сумме предпочтение получает текущий график."
     if objective == "robust":
-        return "Сначала выбран график, который выдерживает больше заданных стресс-сценариев; при равенстве сравниваются максимальный месячный платёж и общая сумма выплат."
-    return "Сбалансированный вариант минимизирует среднее относительное положение по двум целям: максимальному платежу за месяц и общей сумме выплат."
+        return "Приоритет у графика, который выдерживает больше стресс-сценариев. При равенстве используется баланс платежа и общей суммы среди лучших компромиссов."
+    return "Среди лучших компромиссов максимальный платёж и общая сумма выплат сравниваются с равными весами. Варианты, которые уступают другому по этим показателям и стресс-проверкам, не меняют шкалу."
 
 
 def recommendation_reason(case: BorrowerCase, plan: Plan, budget_share: float) -> list[str]:
     reasons = [
-        f"Максимальный платёж {plan.peak_monthly_payment:,.0f} ₸ укладывается в лимит {budget_share:.0%} свободного бюджета ({plan.budget_limit:,.0f} ₸).".replace(",", " "),
+        (
+            f"Платёж проходит лимит {budget_share:.0%} свободного бюджета в каждом месяце. "
+            f"Наименьший запас — в месяце {plan.budget_check_month}: платёж {plan.budget_check_payment:,.0f} ₸ "
+            f"при лимите {plan.budget_limit:,.0f} ₸."
+        ).replace(",", " "),
         f"Сумма выплат за оставшийся срок — {plan.total_repayment:,.0f} ₸; расчётная стоимость финансирования — {plan.interest_cost:,.0f} ₸.".replace(",", " "),
         f"График остаётся в бюджетном лимите в {plan.stress_passes} из {plan.stress_total} заданных стресс-сценариев.",
     ]
-    if case.income_drop > 0:
-        reasons.append(f"Для бюджета учтено снижение обычного дохода на {case.income_drop:.0%}.")
-    elif plan.grace_months:
+    if plan.grace_months:
         reasons.append(f"Первые {plan.grace_months} мес. платежи приостановлены; проценты за паузу капитализируются.")
+    elif case.income_drop > 0 and case.income_recovery_months > 0:
+        recovery_end = max(1, case.income_recovery_wait_months) + case.income_recovery_months
+        reasons.append(f"По сценарию обычный доход возвращается в месяце {recovery_end}.")
     else:
         reasons.append(f"Срок составляет {plan.term_months} мес., включая возможную паузу.")
     return reasons[:4]
@@ -365,31 +477,34 @@ def recommendation_reason(case: BorrowerCase, plan: Plan, budget_share: float) -
 def monthly_schedule(case: BorrowerCase, plan: Plan, horizon: int = 12) -> list[float]:
     """Return actual monthly cash payments, including a final current-plan balloon."""
     horizon = max(0, int(horizon))
-    schedule: list[float] = []
-    if plan.key != "current":
-        for month in range(1, horizon + 1):
-            if month > plan.term_months:
-                schedule.append(0.0)
-            elif month <= plan.grace_months:
-                schedule.append(0.0)
-            else:
-                schedule.append(plan.monthly_payment)
-        return schedule
+    if plan.key == "current":
+        payments, _ = _current_payments(case, plan.term_months)
+        return (payments + [0.0] * max(0, horizon - len(payments)))[:horizon]
+    return [
+        plan.monthly_payment if plan.grace_months < month <= plan.term_months else 0.0
+        for month in range(1, horizon + 1)
+    ]
 
-    balance = max(0.0, case.balance)
-    monthly_rate = max(0.0, case.annual_rate) / 100.0 / 12.0
-    for month in range(1, horizon + 1):
-        if month > plan.term_months:
-            schedule.append(0.0)
-            continue
-        due = balance * (1.0 + monthly_rate)
-        payment = min(max(0.0, case.current_payment), due)
-        balance = max(0.0, due - payment)
-        if month == plan.term_months:
-            payment += balance
-            balance = 0.0
-        schedule.append(payment)
-    return schedule
+
+def stress_details(case: BorrowerCase, plan: Plan, budget_share: float) -> list[StressCheck]:
+    """Report the largest shortfall and its month for each failed scenario."""
+    payments = monthly_schedule(case, plan, plan.term_months)
+    checks = []
+    for name, income_shock, expense_shock in STRESS_SCENARIOS:
+        budget = monthly_budget(
+            case, budget_share, plan.term_months, income_shock=income_shock, expense_shock=expense_shock
+        )
+        tightest = min(
+            ((month, paid) for month, paid in zip(budget, payments) if not _fits_month(month, paid)),
+            key=lambda item: _budget_margin(*item),
+            default=None,
+        )
+        if tightest is None:
+            checks.append(StressCheck(name, passed=True))
+        else:
+            month, paid = tightest
+            checks.append(StressCheck(name, passed=False, shortfall_month=month.month, shortfall=-_budget_margin(month, paid)))
+    return checks
 
 
 def amortization_schedule(case: BorrowerCase, plan: Plan) -> list[AmortizationRow]:

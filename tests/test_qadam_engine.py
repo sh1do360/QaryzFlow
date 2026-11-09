@@ -8,12 +8,34 @@ from qadam_engine import (
     choose_plan,
     free_cash,
     make_plans,
+    monthly_budget,
     monthly_schedule,
     sort_plans,
+    stress_details,
 )
 
 
 class ScheduleOptimizerTests(unittest.TestCase):
+    def test_demo_cases_cover_pause_balloon_deficit_and_zero_rate(self) -> None:
+        cases = {case.case_id: case for case in CASES}
+        recovery = choose_plan(make_plans(cases["Q-1301"]), "cost")
+        self.assertEqual(recovery.grace_months, 3)
+
+        balloon = make_plans(cases["Q-1320"], max_extension_months=0)
+        self.assertLess(balloon[0].monthly_payment, balloon[0].budget_limit)
+        self.assertEqual(balloon[0].budget_check_month, 12)
+        self.assertFalse(balloon[0].is_feasible)
+        self.assertEqual(choose_plan(balloon, "cost").key, "term-12-grace-0")
+
+        self.assertLess(free_cash(cases["Q-1334"]), 0.0)
+        self.assertIsNone(choose_plan(make_plans(cases["Q-1334"])))
+
+        zero_rate = make_plans(cases["Q-1370"])
+        self.assertTrue(zero_rate[0].is_feasible)
+        self.assertEqual(zero_rate[0].stress_passes, 4)
+        self.assertEqual(choose_plan(zero_rate, "cost").key, "current")
+        self.assertLess(choose_plan(zero_rate, "affordable").peak_monthly_payment, zero_rate[0].peak_monthly_payment)
+
     def test_annuity_handles_zero_rate_and_positive_rate(self) -> None:
         self.assertAlmostEqual(annuity_payment(120_000, 0.0, 12), 10_000)
         self.assertGreater(annuity_payment(120_000, 24.0, 12), 10_000)
@@ -21,9 +43,83 @@ class ScheduleOptimizerTests(unittest.TestCase):
     def test_search_enumerates_each_term_and_grace_pair(self) -> None:
         case = replace(CASES[0], remaining_months=4)
         plans = make_plans(case, max_extension_months=2, max_grace_months=1)
-        self.assertEqual(len(plans), 6)
+        self.assertEqual(len(plans), 7)
         self.assertEqual(sum(plan.key == "current" for plan in plans), 1)
         self.assertEqual(len({plan.key for plan in plans}), len(plans))
+
+    def test_recalculation_at_same_term_can_be_the_only_feasible_plan(self) -> None:
+        case = replace(
+            CASES[0], income=100_000, income_drop=0.0, essential_expenses=80_000,
+            other_debt_payment=0.0, balance=120_000, annual_rate=0.0,
+            current_payment=5_000, remaining_months=12,
+        )
+        plans = make_plans(case, max_extension_months=0, max_grace_months=0)
+
+        self.assertFalse(plans[0].is_feasible)
+        chosen = choose_plan(plans)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.key, "term-12-grace-0")
+        self.assertEqual(chosen.monthly_payment, 10_000)
+
+    def test_pause_can_bridge_temporary_reduction_in_income(self) -> None:
+        case = replace(
+            CASES[0], income=120_000, income_drop=0.25, essential_expenses=80_000,
+            other_debt_payment=0.0, balance=120_000, annual_rate=0.0,
+            current_payment=20_000, remaining_months=6,
+        )
+        settings = dict(budget_share=1.0, max_extension_months=0, max_grace_months=2)
+        self.assertIsNone(choose_plan(make_plans(case, **settings)))
+
+        recovering = replace(case, income_recovery_months=2)
+        self.assertEqual([month.income for month in monthly_budget(recovering, 1.0, 4)], [90_000, 105_000, 120_000, 120_000])
+        plans = make_plans(recovering, **settings)
+        chosen = choose_plan(plans, "cost")
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen.grace_months, 1)
+        self.assertEqual(chosen.budget_check_month, 2)
+        self.assertEqual(chosen.budget_limit, 25_000)
+        self.assertEqual(chosen.budget_check_payment, 24_000)
+        self.assertAlmostEqual(chosen.payment_share_of_free_cash, 0.96)
+        two_month_pause = next(plan for plan in plans if plan.grace_months == 2)
+        self.assertTrue(dict(two_month_pause.stress_results)["Расходы выше на 10%"])
+
+        deficit = replace(recovering, essential_expenses=92_000)
+        self.assertIsNone(choose_plan(make_plans(deficit, **settings)))
+
+    def test_delayed_recovery_changes_the_necessary_pause_and_stress_month(self) -> None:
+        case = replace(CASES[3], income_recovery_months=3, income_recovery_wait_months=3)
+        self.assertEqual([round(month.payment_limit) for month in monthly_budget(case, 0.8, 6)],
+                         [54_160, 54_160, 54_160, 90_240, 126_320, 162_400])
+        plans = make_plans(case)
+        selected = choose_plan(plans, "cost")
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.key, "term-20-grace-3")
+        checks = stress_details(case, selected, 0.8)
+        self.assertEqual(tuple((check.name, check.passed) for check in checks), selected.stress_results)
+        expense_check = next(check for check in checks if check.name == "Расходы выше на 10%")
+        self.assertEqual(expense_check.shortfall_month, 4)
+        self.assertAlmostEqual(expense_check.shortfall, 10_379, delta=1)
+
+    def test_dominated_plans_do_not_change_balanced_choice(self) -> None:
+        without_pause = make_plans(CASES[3], max_grace_months=0)
+        with_pause = make_plans(CASES[3], max_grace_months=3)
+        self.assertGreater(sum(plan.is_feasible for plan in with_pause), sum(plan.is_feasible for plan in without_pause))
+        self.assertEqual(choose_plan(without_pause).key, "term-45-grace-0")
+        self.assertEqual(choose_plan(with_pause).key, "term-45-grace-0")
+
+    def test_final_balance_is_checked_in_its_own_recovered_month(self) -> None:
+        case = replace(
+            CASES[0], income=125_000, income_drop=0.2, essential_expenses=85_000,
+            other_debt_payment=0.0, balance=45_000, annual_rate=0.0,
+            current_payment=8_000, remaining_months=3,
+        )
+        self.assertFalse(make_plans(case, max_extension_months=0)[0].is_feasible)
+
+        current = make_plans(replace(case, income_recovery_months=2), max_extension_months=0)[0]
+        self.assertTrue(current.is_feasible)
+        self.assertEqual(current.budget_check_month, 3)
+        self.assertEqual(current.budget_check_payment, 29_000)
+        self.assertEqual(current.budget_limit, 32_000)
 
     def test_budget_limit_is_a_hard_constraint(self) -> None:
         case = replace(

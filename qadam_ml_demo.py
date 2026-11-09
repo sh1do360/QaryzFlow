@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.linear_model import LogisticRegression
@@ -18,43 +19,29 @@ from sklearn.metrics import (
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from qadam_engine import BorrowerCase, Plan, free_cash
+from qadam_engine import BorrowerCase, Plan
+from qadam_synthetic import (
+    DEFAULT_ROWS,
+    DEFAULT_SEED,
+    FEATURE_LABELS,
+    FEATURE_NAMES,
+    OBSERVED_PAYMENTS,
+    SCENARIOS,
+    generate_synthetic_dataset,
+    plan_features,
+    simulate_dataset,
+)
 
 
-DEFAULT_ROWS = 8_000
-DEFAULT_SEED = 20261012
 MIN_TRAINING_ROWS = 500
-MAX_SEED = 2_147_483_647
 LOGISTIC_KEY = "logistic"
 BOOSTING_KEY = "boosting"
 BASELINE_KEY = "baseline"
+BURDEN_BASELINE_KEY = "burden_baseline"
 RANKING_MODEL_KEYS = (LOGISTIC_KEY, BOOSTING_KEY)
 RANKING_MODEL_LABELS = {
     LOGISTIC_KEY: "Логистическая регрессия",
     BOOSTING_KEY: "Градиентный бустинг",
-}
-
-FEATURE_NAMES = (
-    "payment_share_of_free_cash",
-    "balance_to_monthly_income",
-    "other_debt_share",
-    "annual_rate_pct",
-    "term_months",
-    "income_drop_share",
-    "overdue_months",
-    "reserve_months",
-    "grace_months",
-)
-FEATURE_LABELS = {
-    "payment_share_of_free_cash": "Максимальный платёж / свободный бюджет",
-    "balance_to_monthly_income": "Остаток долга / месячный доход",
-    "other_debt_share": "Платежи по другим долгам / доход",
-    "annual_rate_pct": "Номинальная годовая ставка, %",
-    "term_months": "Срок графика, мес.",
-    "income_drop_share": "Снижение дохода, доля",
-    "overdue_months": "Текущая просрочка, мес.",
-    "reserve_months": "Резерв, мес. расходов",
-    "grace_months": "Пауза, мес.",
 }
 
 
@@ -89,6 +76,7 @@ class SyntheticModelDemo:
     train_success_share: float
     test_success_share: float
     seed: int
+    scenario_summary: tuple[dict[str, object], ...]
     holdout_examples: tuple[dict[str, object], ...]
 
     def get_model(self, key: str) -> ModelEvaluation:
@@ -98,115 +86,6 @@ class SyntheticModelDemo:
         raise KeyError(f"Неизвестная демонстрационная модель: {key}")
 
 
-def _synthetic_success_probability(features: np.ndarray) -> np.ndarray:
-    """Nonlinear teaching rule; it is not estimated from borrower outcomes."""
-    (
-        payment_share,
-        balance_ratio,
-        other_debt_share,
-        annual_rate,
-        term,
-        income_drop,
-        overdue,
-        reserve,
-        grace,
-    ) = features.T
-    payment_pressure = np.maximum(payment_share - 0.60, 0.0)
-    log_odds = (
-        3.45
-        - 2.65 * payment_share
-        - 0.043 * balance_ratio
-        - 0.70 * other_debt_share
-        - 0.026 * annual_rate
-        - 0.005 * term
-        - 1.00 * income_drop
-        - 0.23 * overdue
-        + 0.11 * reserve
-        - 0.09 * grace
-        - 2.4 * payment_pressure**2
-        - 1.8 * payment_pressure * income_drop
-    )
-    return 1.0 / (1.0 + np.exp(-np.clip(log_odds, -30.0, 30.0)))
-
-
-def generate_synthetic_dataset(
-    rows: int = DEFAULT_ROWS,
-    seed: int = DEFAULT_SEED,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Create correlated fictional records with a shifted later cohort."""
-    if not isinstance(rows, (int, np.integer)):
-        raise ValueError("Количество строк должно быть целым числом.")
-    if rows < 100:
-        raise ValueError("Для генератора нужно не меньше 100 искусственных строк.")
-    if not isinstance(seed, (int, np.integer)) or seed < 0 or seed > MAX_SEED:
-        raise ValueError(f"Seed должен быть целым числом от 0 до {MAX_SEED}.")
-
-    rng = np.random.default_rng(seed)
-    future_cohort = np.arange(rows) >= int(rows * 0.80)
-    financial_pressure = rng.beta(2.1, 2.4, rows)
-
-    payment_share = (
-        0.06
-        + 1.03 * financial_pressure
-        + rng.normal(0.0, 0.11, rows)
-        + 0.055 * future_cohort
-    )
-    balance_ratio = (
-        1.5
-        + 23.0 * financial_pressure
-        + rng.normal(0.0, 3.8, rows)
-    )
-    other_debt_share = (
-        0.015
-        + 0.39 * financial_pressure
-        + rng.normal(0.0, 0.045, rows)
-    )
-    annual_rate = (
-        7.0
-        + 25.0 * financial_pressure
-        + rng.normal(0.0, 4.0, rows)
-        + 3.0 * future_cohort
-    )
-    term = np.rint(
-        12.0 + 145.0 * financial_pressure + rng.normal(0.0, 13.0, rows)
-    )
-    income_drop = (
-        rng.beta(1.35, 8.0, rows) * 0.70
-        + 0.10 * future_cohort
-    )
-    overdue_probability = np.clip(
-        0.035 + 0.50 * financial_pressure + 0.08 * future_cohort,
-        0.0,
-        0.90,
-    )
-    overdue_active = rng.random(rows) < overdue_probability
-    overdue_months = np.where(overdue_active, rng.integers(1, 7, rows), 0)
-    reserve_months = (
-        7.3 * (1.0 - financial_pressure)
-        + rng.normal(0.0, 0.95, rows)
-        - 0.65 * future_cohort
-    )
-    grace_months = np.rint(
-        5.0 * financial_pressure + rng.normal(0.0, 1.4, rows)
-    )
-
-    features = np.column_stack(
-        (
-            np.clip(payment_share, 0.05, 1.25),
-            np.clip(balance_ratio, 0.5, 30.0),
-            np.clip(other_debt_share, 0.0, 0.50),
-            np.clip(annual_rate, 0.0, 45.0),
-            np.clip(term, 1.0, 180.0),
-            np.clip(income_drop, 0.0, 0.70),
-            overdue_months,
-            np.clip(reserve_months, 0.0, 8.0),
-            np.clip(grace_months, 0.0, 6.0),
-        )
-    ).astype(float)
-
-    probabilities = _synthetic_success_probability(features)
-    labels = rng.binomial(1, probabilities).astype(int)
-    return features, labels
 
 
 def _calibration_points(
@@ -278,13 +157,14 @@ def train_synthetic_model(
     rows: int = DEFAULT_ROWS,
     seed: int = DEFAULT_SEED,
 ) -> SyntheticModelDemo:
-    """Fit three models and compare them on a later synthetic cohort."""
+    """Compare two full models and two baselines on a later synthetic cohort."""
     if rows < MIN_TRAINING_ROWS:
         raise ValueError(
             f"Для обучения и контрольной когорты нужно не меньше {MIN_TRAINING_ROWS} строк."
         )
 
-    features, labels = generate_synthetic_dataset(rows, seed)
+    dataset = simulate_dataset(rows, seed)
+    features, labels = dataset.features, dataset.labels
     split_at = int(rows * 0.80)
     x_train, x_test = features[:split_at], features[split_at:]
     y_train, y_test = labels[:split_at], labels[split_at:]
@@ -318,6 +198,20 @@ def train_synthetic_model(
                 random_state=seed,
             ),
             True,
+        ),
+        (
+            BURDEN_BASELINE_KEY,
+            "Базовый ориентир: только доля платежа",
+            Pipeline(
+                [
+                    (
+                        "payment_share",
+                        ColumnTransformer([("burden", "passthrough", [FEATURE_NAMES.index("payment_share_of_free_cash")])]),
+                    ),
+                    ("classifier", LogisticRegression(max_iter=1_000, random_state=seed)),
+                ]
+            ),
+            False,
         ),
         (
             BASELINE_KEY,
@@ -370,11 +264,22 @@ def train_synthetic_model(
     for index, (feature_row, label) in enumerate(
         zip(x_test[:8], y_test[:8], strict=True)
     ):
+        loan = dataset.loans[split_at + index]
+        missed_month = int(dataset.missed_month[split_at + index])
         row: dict[str, object] = {
-            FEATURE_LABELS[name]: round(float(value), 3)
-            for name, value in zip(FEATURE_NAMES, feature_row, strict=True)
+            "Учебная запись": loan.case.case_id,
+            "Профиль дохода": loan.scenario,
+            "Остаток долга, ₸": loan.case.balance,
+            "Расчётный платёж, ₸": round(loan.payment, 2),
+            "Платежей в горизонте": min(OBSERVED_PAYMENTS, loan.term_months - loan.grace_months),
+            "Первый пропуск, месяц графика": missed_month or None,
+            "Нехватка на платёж, ₸": round(float(dataset.missed_amount[split_at + index]), 2) if missed_month else None,
+            "Исход в симуляции": "Все платежи вовремя" if label else "Неполный платёж",
+            **{
+                FEATURE_LABELS[name]: round(float(value), 3)
+                for name, value in zip(FEATURE_NAMES, feature_row, strict=True)
+            },
         }
-        row["Искусственная метка"] = "Успех" if label else "Неуспех"
         row["Скор логистической регрессии"] = round(
             float(holdout_probabilities[LOGISTIC_KEY][index]), 3
         )
@@ -382,6 +287,18 @@ def train_synthetic_model(
             float(holdout_probabilities[BOOSTING_KEY][index]), 3
         )
         example_rows.append(row)
+
+    scenarios = np.asarray([loan.scenario for loan in dataset.loans])
+    scenario_summary = []
+    for scenario in SCENARIOS:
+        train_matches = scenarios[:split_at] == scenario
+        test_matches = scenarios[split_at:] == scenario
+        scenario_summary.append({
+            "Профиль дохода": scenario,
+            "Обучение": int(train_matches.sum()),
+            "Поздняя проверка": int(test_matches.sum()),
+            "Без пропусков в проверке, %": round(float(y_test[test_matches].mean() * 100), 1) if np.any(test_matches) else None,
+        })
 
     return SyntheticModelDemo(
         models=tuple(evaluations),
@@ -391,32 +308,11 @@ def train_synthetic_model(
         train_success_share=float(y_train.mean()),
         test_success_share=float(y_test.mean()),
         seed=seed,
+        scenario_summary=tuple(scenario_summary),
         holdout_examples=tuple(example_rows),
     )
 
 
-def plan_features(case: BorrowerCase, plan: Plan) -> np.ndarray:
-    """Build model inputs, bounding ratios to the synthetic generator range."""
-    cash = free_cash(case)
-    income = max(0.0, case.income) * (1.0 - max(0.0, min(0.70, case.income_drop)))
-    payment_share = plan.peak_monthly_payment / max(cash, 1.0)
-    balance_ratio = max(0.0, case.balance) / max(income, 1.0)
-    other_debt_share = max(0.0, case.other_debt_payment) / max(income, 1.0)
-    reserve_months = max(0.0, case.savings) / max(case.essential_expenses, 1.0)
-    return np.asarray(
-        [[
-            payment_share,
-            max(0.5, min(30.0, balance_ratio)),
-            max(0.0, min(0.50, other_debt_share)),
-            max(0.0, case.annual_rate),
-            plan.term_months,
-            max(0.0, min(0.70, case.income_drop)),
-            max(0, min(6, case.overdue_months)),
-            max(0.0, min(8.0, reserve_months)),
-            plan.grace_months,
-        ]],
-        dtype=float,
-    )
 
 
 def score_plan(
@@ -428,3 +324,44 @@ def score_plan(
     """Return a synthetic-only score for one candidate and selected model."""
     estimator = demo.get_model(model_key).estimator
     return float(estimator.predict_proba(plan_features(case, plan))[0, 1])
+
+
+def rank_feasible_plans(
+    demo: SyntheticModelDemo,
+    case: BorrowerCase,
+    plans: list[Plan],
+    model_key: str,
+) -> list[tuple[float, Plan]]:
+    """Rank the budget-approved candidates in one model call."""
+    eligible = [plan for plan in plans if plan.is_feasible]
+    if not eligible:
+        return []
+    features = np.concatenate([plan_features(case, plan) for plan in eligible])
+    scores = demo.get_model(model_key).estimator.predict_proba(features)[:, 1]
+    return sorted(
+        zip(map(float, scores), eligible, strict=True),
+        key=lambda item: (-item[0], item[1].term_months, item[1].grace_months),
+    )
+
+
+def score_sensitivity(
+    demo: SyntheticModelDemo,
+    case: BorrowerCase,
+    rule_plan: Plan,
+    ml_plan: Plan,
+    model_key: str,
+) -> list[tuple[str, float]]:
+    """Measure score changes when replacing one input of the rule's plan at a time."""
+    original = plan_features(case, rule_plan)[0]
+    alternative = plan_features(case, ml_plan)[0]
+    changed = np.flatnonzero(original != alternative)
+    inputs = np.tile(original, (len(changed) + 1, 1))
+    inputs[np.arange(1, len(inputs)), changed] = alternative[changed]
+    scores = demo.get_model(model_key).estimator.predict_proba(inputs)[:, 1]
+    return sorted(
+        (
+            (FEATURE_LABELS[FEATURE_NAMES[index]], float(score - scores[0]))
+            for index, score in zip(changed, scores[1:], strict=True)
+        ),
+        key=lambda item: -abs(item[1]),
+    )
