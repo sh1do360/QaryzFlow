@@ -2,8 +2,7 @@ $ErrorActionPreference = "Stop"
 $pythonExe = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 
 if (-not (Test-Path -LiteralPath $pythonExe)) {
-    Write-Error "Не найдено виртуальное окружение. Создайте его и установите зависимости по инструкции в README.md."
-    exit 1
+    throw "Не найдено виртуальное окружение. Выполните py -m venv .venv, затем .\.venv\Scripts\python.exe -m pip install -r requirements.txt"
 }
 
 Push-Location -LiteralPath $PSScriptRoot
